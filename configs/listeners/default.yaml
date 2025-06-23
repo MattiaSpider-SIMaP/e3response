@@ -2,9 +2,15 @@ defaults:
   - model_checkpoint
   - early_stopping
   #  - model_summary
+<<<<<<< HEAD
   - metrics_printer
 #  - rich_progress_bar
+=======
+  - rich_progress_bar
+  # - tensor_parity_plots
+>>>>>>> f0b23a3 (Deriv and Si CSH datamodule)
   - _self_
+
 
 model_checkpoint:
   dirpath: ${paths.output_dir}/checkpoints
@@ -15,8 +21,8 @@ model_checkpoint:
   auto_insert_metric_name: False
 
 early_stopping:
-  monitor: "val/loss"
-  patience: 100
-
+  monitor: "val/nmr_tensors_rmse"
+  patience: 20
+  check_on_train_epoch_end: True
 #model_summary:
 #  max_depth: -1
