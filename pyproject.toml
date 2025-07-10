@@ -30,9 +30,14 @@ dependencies = [
     'jaxlib',
     'jraph',
     'e3nn-jax',
+<<<<<<< HEAD
     "reax>=0.6.14,<0.7",
     "tensorial~=0.6",
     "pymatgen",
+=======
+    "reax>=0.2.0",
+    "tensorial>=0.4.2",
+>>>>>>> 9438bfe (Updated to use tensorial experimental diff())
 ]
 
 [project.urls]

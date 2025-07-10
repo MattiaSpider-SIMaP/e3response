@@ -84,10 +84,10 @@ class Polarization(linen.Module):
         )
 
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        derivative, graph = self._diff_fn(
+        polarization, graph = self._diff_fn(
             graph, jnp.zeros_like(graph.globals[keys.EXTERNAL_ELECTRIC_FIELD])
         )
-        polarization: PolarizationArray = -derivative
+        polarization: PolarizationArray = polarization
 
         if gcnn.keys.CELL in graph.globals:
             # Normalize to get polarization per unit volume
@@ -160,8 +160,8 @@ class DielectricTensor(linen.Module):
     energy_key: str = predicted(atomic.TOTAL_ENERGY)
     electric_field_key: str = keys.EXTERNAL_ELECTRIC_FIELD
     include_identity: bool = True
-    epsilon_0 = 1.0 / (4.0 * math.pi)  # If using atomic units
     out_key: str = predicted(keys.DIELECTRIC_TENSOR)
+    epsilon_0 = 1.0 / (4.0 * math.pi)  # If using atomic units
 
     def setup(self) -> None:
         # pylint: disable=attribute-defined-outside-init
@@ -237,7 +237,6 @@ class BornCharges(linen.Module):
     energy_fn: gcnn.GraphFunction
     energy_key: str = predicted(atomic.TOTAL_ENERGY)
     electric_field_key: str = keys.EXTERNAL_ELECTRIC_FIELD
-    out_key: str = predicted(keys.BORN_CHARGES)
 
     def setup(self) -> None:
         # pylint: disable=attribute-defined-outside-init
@@ -257,7 +256,11 @@ class BornCharges(linen.Module):
         )
         bec: BornEffectiveChargesArray = -derivative
 
-        return gcnn.experimental.update_graph(graph).set(("nodes", self.out_key), bec).get()
+        return (
+            gcnn.experimental.update_graph(graph)
+            .set(("nodes", predicted(keys.BORN_CHARGES)), bec)
+            .get()
+        )
 
 
 class RamanTensors(linen.Module):
@@ -300,7 +303,6 @@ class RamanTensors(linen.Module):
     energy_fn: gcnn.GraphFunction
     energy_key: str = predicted(atomic.TOTAL_ENERGY)
     electric_field_key: str = keys.EXTERNAL_ELECTRIC_FIELD
-    out_key: str = predicted(keys.RAMAN_TENSORS)
 
     def setup(self) -> None:
         # pylint: disable=attribute-defined-outside-init
@@ -324,4 +326,8 @@ class RamanTensors(linen.Module):
         )
         raman: RamanTensorsArray = -derivative
 
-        return gcnn.experimental.update_graph(graph).set(("nodes", self.out_key), raman).get()
+        return (
+            gcnn.experimental.update_graph(graph)
+            .set(("nodes", predicted(keys.RAMAN_TENSORS)), raman)
+            .get()
+        )
