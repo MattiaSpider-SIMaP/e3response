@@ -102,6 +102,10 @@ def test_qm9_nmr_datamodule(dataset_name, test_engine):
         # Check mu
         assert "mu" in batch.nodes, f"{loader_fn} batch missing 'mu'"
         mu = batch.nodes["mu"]
+<<<<<<< HEAD
+=======
+        print(mu)
+>>>>>>> 8fda61e (Added magnetic deriv model and datamodule for Si and CSH dataset)
 
         assert isinstance(mu, np.ndarray), f"'mu' in {loader_fn} is not a numpy array"
         assert mu.ndim == 1, f"'mu' in {loader_fn} has wrong shape {mu.shape}, expected 1D array"
