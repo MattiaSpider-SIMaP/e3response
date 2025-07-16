@@ -3,7 +3,6 @@ import pathlib
 
 import hydra
 from hydra.core import hydra_config
-import jraph
 import omegaconf
 import reax.utils
 import tensorial
@@ -11,8 +10,6 @@ import tensorial
 from . import config, utils
 
 _LOGGER = logging.getLogger(__name__)
-
-GraphsData = tuple[jraph.GraphsTuple]
 
 
 def train(cfg: omegaconf.DictConfig):
