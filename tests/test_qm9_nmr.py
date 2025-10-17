@@ -5,6 +5,7 @@ import pytest
 import reax
 
 from e3response.data.qm9_nmr import DATASET_URLS, Qm9NmrDataModule, Qm9NmrDataset
+<<<<<<< HEAD
 
 mock_dir = Path(__file__).parent / "mock_datasets" / "qm9_nmr"
 
@@ -15,6 +16,16 @@ def test_qm9_nmr_dataset(dataset_name):
         dataset=dataset_name,
         atom_keys=["species", "anisotropy"],
         data_dir=mock_dir,
+=======
+
+
+@pytest.mark.parametrize("dataset_name", list(DATASET_URLS.keys()))
+def test_qm9mrdataset_graphs_contain_expected_keys(dataset_name):
+    dataset = Qm9NmrDataset(
+        dataset=dataset_name,
+        atom_keys=["species", "anisotropy"],
+        limit=10,
+>>>>>>> d0dc4b0 (Fixes for qm9 dataset and datamodule PR)
     )
     assert len(dataset) > 0
 
@@ -102,10 +113,6 @@ def test_qm9_nmr_datamodule(dataset_name, test_engine):
         # Check mu
         assert "mu" in batch.nodes, f"{loader_fn} batch missing 'mu'"
         mu = batch.nodes["mu"]
-<<<<<<< HEAD
-=======
-        print(mu)
->>>>>>> 8fda61e (Added magnetic deriv model and datamodule for Si and CSH dataset)
 
         assert isinstance(mu, np.ndarray), f"'mu' in {loader_fn} is not a numpy array"
         assert mu.ndim == 1, f"'mu' in {loader_fn} has wrong shape {mu.shape}, expected 1D array"
