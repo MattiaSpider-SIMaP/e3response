@@ -5,7 +5,6 @@ import pytest
 import reax
 
 from e3response.data.qm9_nmr import DATASET_URLS, Qm9NmrDataModule, Qm9NmrDataset
-<<<<<<< HEAD
 
 mock_dir = Path(__file__).parent / "mock_datasets" / "qm9_nmr"
 
@@ -16,16 +15,6 @@ def test_qm9_nmr_dataset(dataset_name):
         dataset=dataset_name,
         atom_keys=["species", "anisotropy"],
         data_dir=mock_dir,
-=======
-
-
-@pytest.mark.parametrize("dataset_name", list(DATASET_URLS.keys()))
-def test_qm9mrdataset_graphs_contain_expected_keys(dataset_name):
-    dataset = Qm9NmrDataset(
-        dataset=dataset_name,
-        atom_keys=["species", "anisotropy"],
-        limit=10,
->>>>>>> d0dc4b0 (Fixes for qm9 dataset and datamodule PR)
     )
     assert len(dataset) > 0
 

@@ -7,7 +7,15 @@ import os
 import pathlib
 import re
 import tempfile
+<<<<<<< HEAD
 from typing import Final
+=======
+<<<<<<< HEAD
+from typing import Any, Final
+=======
+from typing import Any, Callable, Final, Optional, Sequence, Union
+>>>>>>> 69df577 (Fully corrected version of qm9_nmr.py)
+>>>>>>> 7dfd597 (Fully corrected version of qm9_nmr.py)
 import urllib.error
 import urllib.request
 import zipfile
@@ -15,8 +23,8 @@ import zipfile
 import ase
 import jraph
 import numpy as np
-from pymatgen.io import gaussian
-import pymatgen.io.ase
+from pymatgen.io import gaussian  # type: ignore
+import pymatgen.io.ase  # type: ignore
 import reax
 from tensorial import gcnn
 import tqdm
@@ -220,6 +228,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         return structures
 
 
+# pylint: disable=R1710
 def _create_molecule_data(log_file):
     try:
         gaussian_output = gaussian.GaussianOutput(log_file)
