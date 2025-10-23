@@ -8,6 +8,7 @@ import pathlib
 import re
 import tempfile
 <<<<<<< HEAD
+<<<<<<< HEAD
 from typing import Final
 =======
 <<<<<<< HEAD
@@ -16,6 +17,9 @@ from typing import Any, Final
 from typing import Any, Callable, Final, Optional, Sequence, Union
 >>>>>>> 69df577 (Fully corrected version of qm9_nmr.py)
 >>>>>>> 7dfd597 (Fully corrected version of qm9_nmr.py)
+=======
+from typing import Any, Final
+>>>>>>> 3951d72 (Added -f to git repo notebooks and si and csh datasets)
 import urllib.error
 import urllib.request
 import zipfile
