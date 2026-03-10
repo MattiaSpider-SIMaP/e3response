@@ -2,8 +2,8 @@
 
 mlflow:
   _target_: reax.loggers.mlflow.MLFlowLogger
-  experiment_name: e3response_Si-NMR
-  run_name: run - nequip_nmr - LSfixed
+  experiment_name: e3response_QM9-NMR
+  run_name: try # diff_model - 500mol - no regularization on B_ind
   tags:
     mlflow.user: ${oc.env:USER}
   prefix: ""

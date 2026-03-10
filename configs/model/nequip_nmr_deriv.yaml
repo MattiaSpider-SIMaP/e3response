@@ -4,7 +4,7 @@ metrics:
     nmr_tensors_rmse:
       _target_: tensorial.gcnn.graph_metric
       metric: rmse
-      predictions: nodes.NMR_tensors_predicted
+      predictions: nodes.predicted_NMR_tensors
       targets: nodes.NMR_tensors
 
 optimizer:
@@ -12,15 +12,21 @@ optimizer:
   # learning_rate: 0.01
   learning_rate:
     _target_: optax.exponential_decay
-    init_value: 0.001
+    init_value: 0.01
     transition_steps: 500
     decay_rate: 0.9
 
 loss_fn:
-  _target_: tensorial.gcnn.Loss
-  field: nodes.NMR_tensors_predicted
-  target_field: nodes.NMR_tensors
-  reduction: "sum"
+  _target_: e3response.losses.response_loss
+  induced_magnetic_field: false
+  nmr_tensors: true
+
+# loss_fn:
+#   _target_: tensorial.gcnn.Loss
+#   field: nodes.NMR_tensors_predicted
+#   target_field: nodes.NMR_tensors
+#   reduction: "sum"
+
 
 model:
   _target_: tensorial.nn.Sequential
@@ -73,7 +79,7 @@ model:
       # Per-atom local magnetic field
     - _target_: tensorial.gcnn.NodewiseLinear
       irreps_out: 1x1o
-      out_field: B_ind_predicted
+      out_field: predicted_induced_magnetic_field
 
     - _target_: e3response.magnetic.MagneticShieldingTensor
       _partial_: True

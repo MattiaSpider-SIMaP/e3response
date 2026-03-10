@@ -17,3 +17,5 @@ EXTERNAL_MAGNETIC_FIELD: Final[str] = "external_magnetic_field"
 INDUCED_MAGNETIC_FIELD: Final[str] = "induced_magnetic_field"
 LOCAL_MAGNETIC_FIELD: Final[str] = "local_magnetic_field"
 MAGNETIC_SHIELDING_TENSOR: Final[str] = "magnetic_shielding_tensor"
+NMR_TENSORS: Final[str] = "NMR_tensors"
+

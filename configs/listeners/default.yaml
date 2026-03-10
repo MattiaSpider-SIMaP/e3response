@@ -8,11 +8,16 @@ defaults:
 =======
   - rich_progress_bar
 <<<<<<< HEAD
+<<<<<<< HEAD
   # - tensor_parity_plots
 >>>>>>> f0b23a3 (Deriv and Si CSH datamodule)
 =======
   - tensor_parity_plots
 >>>>>>> 05386dc (Added magnetic deriv model and datamodule for Si and CSH dataset)
+=======
+  - parity_plots
+  # - tensor_parity_plots
+>>>>>>> 8fa5ce3 (Pre rebase save)
   - _self_
 
 model_checkpoint:

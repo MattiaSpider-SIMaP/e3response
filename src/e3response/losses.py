@@ -17,6 +17,9 @@ def response_loss(
     dielectric_tensor: bool | float = False,
     born_charges: bool | float = False,
     raman_tensors: bool | float = False,
+    nmr_tensors: bool | float = False,
+    induced_magnetic_field: bool | float = False,
+
 ) -> Callable[[jraph.GraphsTuple, jraph.GraphsTuple], jax.Array]:
     weights: list[float] = []
     loss_terms = []
@@ -79,6 +82,18 @@ def response_loss(
                 f"nodes.{keys.RAMAN_TENSORS}",
                 f"nodes.{predicted(keys.RAMAN_TENSORS)}",
             )
+        )
+
+    if nmr_tensors:
+        weights.append(1.0 if isinstance(nmr_tensors, bool) else nmr_tensors)
+        loss_terms.append(
+            gcnn.Loss(f"nodes.{predicted(keys.NMR_TENSORS)}", f"nodes.{keys.NMR_TENSORS}")
+        )
+
+    if induced_magnetic_field:
+        weights.append(1.0 if isinstance(induced_magnetic_field, bool) else induced_magnetic_field)
+        loss_terms.append(
+            gcnn.Loss(f"nodes.{predicted(keys.INDUCED_MAGNETIC_FIELD)}", f"nodes.{keys.EXTERNAL_MAGNETIC_FIELD}")
         )
 
     if not loss_terms:

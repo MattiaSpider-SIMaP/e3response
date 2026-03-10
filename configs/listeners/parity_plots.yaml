@@ -1,0 +1,2 @@
+parity_plots:
+  _target_: tensorial.reaxkit.listeners.parity_plotter.ParityPlotter

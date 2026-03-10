@@ -22,27 +22,19 @@ _LOGGER = logging.getLogger(__name__)
 __all__ = ("TensorParityPlots",)
 
 
-def prediction_vs_ground_truth(y_train, y_train_hat, y_val, y_val_hat, y_test, y_test_hat, title):
+def prediction_vs_ground_truth(y_train, y_train_hat, y_test, y_test_hat, title):
     """Plot prediction vs ground truth for train and test."""
     fontsize = 12
     fig, ax = plt.subplots(figsize=(6, 5))
-
     ax.scatter(y_train, y_train_hat, s=25, c="#b2df8a", label="Train")
-    ax.scatter(y_val, y_val_hat, s=25, c="#1f78b4", label="Val")
-    ax.scatter(y_test, y_test_hat, s=25, c="#f19428", label="Test")
-
-    all_obs = jnp.concatenate([y_train, y_val, y_test])
-    ax.plot([all_obs.min(), all_obs.max()],
-            [all_obs.min(), all_obs.max()],
-            'k:', lw=1.5)
-
+    ax.plot([y_train.min(), y_train.max()], [y_train.min(), y_train.max()], "k:", lw=1.5)
     ax.set_aspect("equal")
     ax.set_xlabel("Observation", fontsize=fontsize)
     ax.set_ylabel("Prediction", fontsize=fontsize)
     ax.set_title(title, fontsize=fontsize)
+    ax.scatter(y_test, y_test_hat, s=25, c="#1f78b4", label="Test")
     ax.legend(fontsize=fontsize, handletextpad=0.1, borderpad=0.1)
     fig.tight_layout()
-
     return fig
 
 
@@ -61,7 +53,7 @@ def calculate_tensor_scalars(tensors):
         sigma_iso = (sigma_xx + sigma_yy + sigma_zz) / 3
         eta = (
             (sigma_xx - sigma_yy) / (sigma_zz - sigma_iso)
-            if abs(sigma_zz - sigma_iso) > 1e-6
+            if abs(sigma_zz - sigma_iso) > 1e-12
             else 0
         )
 
@@ -87,23 +79,17 @@ def extract_scalars(scalars_list, key):
     return jnp.array([scalars[key] for scalars in scalars_list])
 
 
-def compute_tensor_scalars_from_dataloader(dataloader, model, parameters, scalar_keys):
+def compute_tensor_scalars_from_dataloader(predict, scalar_keys):
 
     all_ground_truth = {key: [] for key in scalar_keys}
     all_predicted = {key: [] for key in scalar_keys}
 
-    for batch in dataloader:
+    for batch in predict.predictions:
 
-        from jax import device_put
-
-        batch = device_put(batch)
-
-        mask = batch[0].nodes["mask"]
-        y = batch[0].nodes["NMR_tensors"][mask]
-
-        predictions = model.apply(parameters, batch[0])
-        mask_hat = predictions[0]["mask"]
-        y_hat = predictions[0]["predicted_NMR_tensors"][mask_hat]
+        nodes = batch[0].nodes
+        mask = nodes["mask"]
+        y = nodes["NMR_tensors"][mask]
+        y_hat = nodes["NMR_tensors_predicted"][nodes["mask"]]
 
         scalars_gt = calculate_tensor_scalars(y)
         scalars_pred = calculate_tensor_scalars(y_hat)
@@ -117,7 +103,7 @@ def compute_tensor_scalars_from_dataloader(dataloader, model, parameters, scalar
 
 class TensorParityPlots(hooks.TrainerListener):
     """
-    Compute scalar quantities from NMR tensors and log parity plots at the end of training and testing.
+    Compute scalar quantities from NMR tensors and log parity plots at the end of training.
     """
 
     def __init__(
@@ -138,85 +124,45 @@ class TensorParityPlots(hooks.TrainerListener):
             "eigenvalues",
         ]
         self.log_rank_zero_only = log_rank_zero_only
-    
-    # def on_fit_epoch_start:
-    #  empty list of predictions and labels 
 
     def on_fit_end(self, trainer: "reax.Trainer", stage: "reax.stages.Fit", /) -> None:
         """Executed after training ends."""
-        rank = trainer.global_rank if trainer.process_count > 1 else None
+        rank = trainer.global_rank if trainer.world_size > 1 else None
         if rank is not None and rank > 0:
             return  # Only rank 0 plots
 
-        _LOGGER.info(rank_zero.rank_prefixed_message("Computing Train and Val data...", rank))
+        _LOGGER.info(rank_zero.rank_prefixed_message("Computing tensor parity plots...", rank))
 
-        mod = trainer._module
+        # mod = trainer._module
+        # data_module = trainer.train_dataloader
 
-        self.datamodule_saved = getattr(trainer, 'datamodule', None)
-
-        self.train_gt, self.train_pred = compute_tensor_scalars_from_dataloader(
-            trainer.train_dataloader, mod._model, mod.parameters(), self.scalar_keys
+        # perform predictions and save them on nodes
+        predict_train = trainer.predict(
+            trainer._module, dataloaders=trainer.train_dataloader, return_predictions=True
+        )
+        predict_val = trainer.predict(
+            trainer._module, dataloaders=trainer.val_dataloaders, return_predictions=True
         )
 
-        self.val_gt, self.val_pred = compute_tensor_scalars_from_dataloader(
-            trainer.val_dataloaders, mod._model, mod.parameters(), self.scalar_keys
+        train_gt, train_pred = compute_tensor_scalars_from_dataloader(
+            predict_train, self.scalar_keys
         )
-
-    
-    def on_test_end(self, trainer: "reax.Trainer", stage: "reax.stages.Test", /) -> None:
-        """Executed after testing ends. Computes Test data and generates all parity plots."""
-        rank = trainer.global_rank if trainer.process_count > 1 else None
-        if rank is not None and rank > 0:
-            return
-
-        _LOGGER.info(rank_zero.rank_prefixed_message("Computing Test data and generating final parity plots...", rank))
-
-        mod = trainer._module
-        if mod is None:
-            raise RuntimeError("Module not found in trainer.")
-
-        test_dl = getattr(stage, "dataloader", None)
-        print(test_dl)
-
-        if test_dl is None:
-            raise RuntimeError("Test dataloader not found in stage.")
-
-        # Compute scalars
-        test_gt, test_pred = compute_tensor_scalars_from_dataloader(
-            test_dl, mod._model, mod.parameters(), self.scalar_keys
-        )
-
-        rmse_per_key = {}
+        val_gt, val_pred = compute_tensor_scalars_from_dataloader(predict_val, self.scalar_keys)
 
         for key in self.scalar_keys:
-            gt = jnp.array(test_gt[key])
-            pred = jnp.array(test_pred[key])
+            train_gt_vals = jnp.array(train_gt[key])
+            train_pred_vals = jnp.array(train_pred[key])
+            val_gt_vals = jnp.array(val_gt[key])
+            val_pred_vals = jnp.array(val_pred[key])
 
-            rmse = jnp.sqrt(jnp.mean((gt - pred) ** 2)).real
-            rmse_per_key[key] = float(rmse)
-
-            title = f"Parity plot for {key} (Test RMSE = {rmse:.4f})"
-
+            title = f"Parity plot for {key}"
             fig = prediction_vs_ground_truth(
-                jnp.array(self.train_gt[key]),
-                jnp.array(self.train_pred[key]),
-                jnp.array(self.val_gt[key]),
-                jnp.array(self.val_pred[key]),
-                jnp.array(test_gt[key]),
-                jnp.array(test_pred[key]),
-                title=title,
+                train_gt_vals, train_pred_vals, val_gt_vals, val_pred_vals, title=title
             )
+            fig.gca().set_aspect("equal")
 
             if trainer.loggers:
                 logger = trainer.loggers[0]
                 if hasattr(logger, "experiment") and hasattr(logger.experiment, "log_figure"):
-                    logger.experiment.log_figure(logger.run_id, fig, f"{key}_parity.png")
-                    _LOGGER.info(rank_zero.rank_prefixed_message(
-                        f"Logged figure for {key}.", rank))
-
-                if hasattr(logger.experiment, "log_metric"):
-                    logger.experiment.log_metric(
-                        logger.run_id,
-                        f"test/scalars_rmse/{key}",
-                        rmse
-                    )
+                    logger.experiment.log_figure(logger.run_id, fig, f"{title}.png")
+                    _LOGGER.info(rank_zero.rank_prefixed_message(f"Logged figure for {key}.", rank))
