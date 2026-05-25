@@ -2,5 +2,5 @@ _target_: e3response.data.qm9_nmr.Qm9NmrDataModule
 r_max: ${r_max}
 data_dir: ${paths.data_dir}/qm9_nmr/
 batch_size: 2 # Needs to be divisible by the number of devices (e.g., if in a distributed setup)
-train_val_test_split: [0.40, 0.30, 0.30]
+train_val_test_split: [0.8, 0.1, 0.1]
 limit: 10

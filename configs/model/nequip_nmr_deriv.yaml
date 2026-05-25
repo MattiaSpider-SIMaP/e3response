@@ -4,29 +4,36 @@ metrics:
     nmr_tensors_rmse:
       _target_: tensorial.gcnn.graph_metric
       metric: rmse
-      predictions: nodes.predicted_NMR_tensors
-      targets: nodes.NMR_tensors
+      predictions: nodes.predicted_nmr_tensors
+      targets: nodes.nmr_tensors
+    # mask: nodes.nmr_active
+
+# optimizer:
+#   _target_: optax.adamw
+#   # learning_rate: 0.01
+#   learning_rate:
+#     _target_: optax.exponential_decay
+#     init_value: 0.01
+#     transition_steps: 500
+#     decay_rate: 0.9
 
 optimizer:
-  _target_: optax.adamw
-  # learning_rate: 0.01
-  learning_rate:
-    _target_: optax.exponential_decay
-    init_value: 0.01
-    transition_steps: 500
-    decay_rate: 0.9
+  _target_: optax.chain
+  _args_:
+    - _target_: optax.contrib.reduce_on_plateau
+      factor: 0.9                      
+      patience: 20
+      rtol: 0.0001         
+      atol: 0.001         
+      cooldown: 5        
+      min_scale: 1.0e-6
+    - _target_: optax.adam
+      learning_rate: 0.1 
 
 loss_fn:
   _target_: e3response.losses.response_loss
-  induced_magnetic_field: false
   nmr_tensors: true
-
-# loss_fn:
-#   _target_: tensorial.gcnn.Loss
-#   field: nodes.NMR_tensors_predicted
-#   target_field: nodes.NMR_tensors
-#   reduction: "sum"
-
+  # induced_magnetic_field: true
 
 model:
   _target_: tensorial.nn.Sequential
@@ -58,28 +65,32 @@ model:
 
     - _target_: tensorial.gcnn.NodewiseLinear
       field: attributes
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e
+      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
 
     - _target_: tensorial.gcnn.NequipLayer
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e
+      num_species: ${from_data.n_elements}     
+      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
       avg_num_neighbours: ${from_data.avg_num_neighbours}
 
     - _target_: tensorial.gcnn.NequipLayer
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e
+      num_species: ${from_data.n_elements}
+      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
       avg_num_neighbours: ${from_data.avg_num_neighbours}
 
     - _target_: tensorial.gcnn.NequipLayer
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e
+      num_species: ${from_data.n_elements}
+      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
       avg_num_neighbours: ${from_data.avg_num_neighbours}
 
-    # Keep only scalars and reduce the number passing this point
+    # Reduce the number passing this point
     - _target_: tensorial.gcnn.NodewiseLinear
-      irreps_out: 4x0e + 4x0o + 4x1e + 4x1o + 4x2e + 4x2o + 2x3o + 2x3e
+      irreps_out: 4x0e + 4x0o + 4x1e + 4x1o + 4x2e + 4x2o #+ 2x3o + 2x3e
 
       # Per-atom local magnetic field
     - _target_: tensorial.gcnn.NodewiseLinear
       irreps_out: 1x1o
       out_field: predicted_induced_magnetic_field
 
+    # Per atom NMR tensors
     - _target_: e3response.magnetic.MagneticShieldingTensor
       _partial_: True

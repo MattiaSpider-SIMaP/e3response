@@ -7,17 +7,8 @@ defaults:
   - data: bto
   - model: nequip_deriv
   - listeners: default
-<<<<<<< HEAD
-<<<<<<< HEAD
-  - logger: csv # set logger here or use command line (e.g. `e3response train logger=tensorboard`)
-  - trainer: default
-=======
-  - logger: mlflow # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
-=======
-  # - logger: mlflow # set logger here or use command line (e.g. `python train.py logger=tensorboard`)
->>>>>>> 8fa5ce3 (Pre rebase save)
+  - logger: many_loggers
   - trainer: gpu
->>>>>>> 05386dc (Added magnetic deriv model and datamodule for Si and CSH dataset)
   - paths: default
   - extras: default
   - hydra: default
@@ -55,10 +46,10 @@ from_data:
 
 # set False to skip model training
 train:
-  min_epochs: 5 # prevents early stopping
-  max_epochs: 6
+  min_epochs: 0 # prevents early stopping
+  max_epochs: 10
   # perform a validation loop every N training epochs
-  check_val_every_n_epoch: 10
+  check_val_every_n_epoch: 2
 
 
 # evaluate on test set, using best model weights achieved during training

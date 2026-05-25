@@ -1,6 +1,7 @@
 from collections.abc import Callable
 
 import jax
+import jax.numpy as jnp
 import jraph
 import optax
 from tensorial import gcnn
@@ -87,13 +88,19 @@ def response_loss(
     if nmr_tensors:
         weights.append(1.0 if isinstance(nmr_tensors, bool) else nmr_tensors)
         loss_terms.append(
-            gcnn.Loss(f"nodes.{predicted(keys.NMR_TENSORS)}", f"nodes.{keys.NMR_TENSORS}")
+            gcnn.Loss(
+                optax.squared_error, 
+                f"nodes.{keys.NMR_TENSORS}",
+                f"nodes.{predicted(keys.NMR_TENSORS)}",
+            )
         )
 
     if induced_magnetic_field:
-        weights.append(1.0 if isinstance(induced_magnetic_field, bool) else induced_magnetic_field)
+        weights.append(1.0 if isinstance(nmr_tensors, bool) else nmr_tensors)
         loss_terms.append(
-            gcnn.Loss(f"nodes.{predicted(keys.INDUCED_MAGNETIC_FIELD)}", f"nodes.{keys.EXTERNAL_MAGNETIC_FIELD}")
+            gcnn.L2Regularization(
+                f"nodes.{predicted(keys.INDUCED_MAGNETIC_FIELD)}",
+            )
         )
 
     if not loss_terms:

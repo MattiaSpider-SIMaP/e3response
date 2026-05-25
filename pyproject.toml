@@ -30,18 +30,9 @@ dependencies = [
     'jaxlib',
     'jraph',
     'e3nn-jax',
-<<<<<<< HEAD
     "reax>=0.6.14,<0.7",
     "tensorial~=0.6",
     "pymatgen",
-=======
-    "reax>=0.2.0",
-    "tensorial>=0.4.2",
-<<<<<<< HEAD
->>>>>>> 9438bfe (Updated to use tensorial experimental diff())
-=======
-    "pymatgen==2025.10.7",
->>>>>>> 7dfd597 (Fully corrected version of qm9_nmr.py)
 ]
 
 [project.urls]

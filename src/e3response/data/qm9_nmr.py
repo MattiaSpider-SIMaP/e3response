@@ -7,19 +7,8 @@ import os
 import pathlib
 import re
 import tempfile
-<<<<<<< HEAD
-<<<<<<< HEAD
-from typing import Final
-=======
-<<<<<<< HEAD
-from typing import Any, Final
-=======
 from typing import Any, Callable, Final, Optional, Sequence, Union
->>>>>>> 69df577 (Fully corrected version of qm9_nmr.py)
->>>>>>> 7dfd597 (Fully corrected version of qm9_nmr.py)
-=======
-from typing import Any, Final
->>>>>>> 3951d72 (Added -f to git repo notebooks and si and csh datasets)
+
 import urllib.error
 import urllib.request
 import zipfile
@@ -105,7 +94,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         self._rmax = r_max
         self._data_dir: Final[str] = data_dir
         self._limit = limit
-        default_keys = ["NMR_tensors", "mu"]
+        default_keys = ["nmr_tensors", "mu"]
         possible_keys = [
             "ind",
             "N",
@@ -333,7 +322,7 @@ def get_structure_and_data_from_log(log_path: pathlib.Path) -> ase.Atoms | None:
         tensors = np.zeros((n_atoms, 3, 3))
         tensors[ind] = molecule_data["tensor"]
 
-        atoms.arrays["NMR_tensors"] = tensors
+        atoms.arrays["nmr_tensors"] = tensors
         atoms.arrays["ind"] = np.array(ind)
         atoms.arrays["N"] = np.array(n_atoms)
         atoms.arrays["species"] = np.array(molecule_data["species"])

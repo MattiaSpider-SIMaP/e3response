@@ -1,4 +1,4 @@
-from . import tensor_parity_plots
-from .tensor_parity_plots import *
+from . import tensor_parity_plotter
+from .tensor_parity_plotter import *
 
-__all__ = tensor_parity_plots.__all__
+__all__ = tensor_parity_plotter.__all__

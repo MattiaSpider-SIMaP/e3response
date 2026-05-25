@@ -2,10 +2,10 @@
 
 mlflow:
   _target_: reax.loggers.mlflow.MLFlowLogger
-  experiment_name: e3response_QM9-NMR
-  run_name: try # diff_model - 500mol - no regularization on B_ind
+  tracking_uri: "file:/home/mattia/Desktop/ml_codes/mlruns"
+  experiment_name: diff_vs_direct_nmr_model
+  run_name: direct_model - 100mol 
   tags:
     mlflow.user: ${oc.env:USER}
   prefix: ""
   artifact_location: null
-  # run_id: ""

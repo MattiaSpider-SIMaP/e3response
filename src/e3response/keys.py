@@ -15,7 +15,8 @@ RAMAN_TENSORS: Final[str] = "raman_tensors"
 # Magnetic
 EXTERNAL_MAGNETIC_FIELD: Final[str] = "external_magnetic_field"
 INDUCED_MAGNETIC_FIELD: Final[str] = "induced_magnetic_field"
-LOCAL_MAGNETIC_FIELD: Final[str] = "local_magnetic_field"
+NUCLEAR_MAGNETIC_MOMENT: Final[str] = "nuclear_magnetic_moment"
 MAGNETIC_SHIELDING_TENSOR: Final[str] = "magnetic_shielding_tensor"
-NMR_TENSORS: Final[str] = "NMR_tensors"
+NMR_TENSORS: Final[str] = "nmr_tensors"
+
 

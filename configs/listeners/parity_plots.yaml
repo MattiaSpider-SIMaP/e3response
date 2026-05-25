@@ -1,2 +1,26 @@
+# parity_plots:
+#   _target_: tensorial.reaxkit.listeners.parity_plotter.GraphParityPlotter
+#   targets: "nodes.nmr_tensors"
+#   predictions: "nodes.predicted_nmr_tensors"
+#   fit_plot_every: 10  
+#   plot_final_combined: True
+
 parity_plots:
-  _target_: tensorial.reaxkit.listeners.parity_plotter.ParityPlotter
+  _target_: e3response.listeners.tensor_parity_plotter.TensorGraphParityPlotter
+  targets: "nodes.nmr_tensors"
+  predictions: "nodes.predicted_nmr_tensors"
+  fit_plot_every: 10
+  plot_final_combined: True
+  show_rmse: True
+  properties_keys: 
+    - "sigma iso"
+    - "frobenius norm"
+    - "symmetric part"
+    - "antisymmetric part"
+    # - "sigma xx"
+    # - "sigma yy"
+    # - "sigma zz"
+    # - "delta sigma"
+    # - "eta"
+    # - "eigenvalues"
+
