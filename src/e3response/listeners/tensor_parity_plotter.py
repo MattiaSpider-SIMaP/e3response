@@ -106,30 +106,35 @@ class TensorGraphParityPlotter(GraphParityPlotter):
     @override
     def _collect_batch_data(self, stage_name: str, outputs: Any | None, batch: Any) -> bool:
         """
-        Modified function to collect properties dictionary.
+        Modified function to collect tensors.
         """
         if outputs is None: return False
 
         tensors_gt, tensors_pred = super()._get_target_predicted(batch, outputs)
         
-        gt_dict = self._compute_all_properties(jnp.array(tensors_gt))
-        pred_dict = self._compute_all_properties(jnp.array(tensors_pred))
+        # gt_dict = self._compute_all_properties(jnp.array(tensors_gt))
+        # pred_dict = self._compute_all_properties(jnp.array(tensors_pred))
 
-        self.data_store[stage_name][0].append(gt_dict)
-        self.data_store[stage_name][1].append(pred_dict)
+        self.data_store[stage_name][0].append(np.array(tensors_gt))
+        self.data_store[stage_name][1].append(np.array(tensors_pred))
         
-        _LOGGER.info(f"Collected tensors properties for {stage_name}")
         return True
 
     @override
     def _plot_parity(self, stage_name: str, save_dir: pathlib.Path, epoch: int | None = None):
-        dicts_gt, dicts_pred = self.data_store[stage_name]
-        if not dicts_gt:
+        raw_gt_list, raw_pred_list = self.data_store[stage_name]
+        if not raw_gt_list:
             return
+        
+        all_tensors_gt = np.concatenate(raw_gt_list, axis=0)
+        all_tensors_pred = np.concatenate(raw_pred_list, axis=0)
+
+        gt_dict = self._compute_all_properties(jnp.array(all_tensors_gt))
+        pred_dict = self._compute_all_properties(jnp.array(all_tensors_pred))
 
         for key in self.properties_keys:
-            y_true = np.concatenate([np.array(d[key]).flatten() for d in dicts_gt])
-            y_pred = np.concatenate([np.array(d[key]).flatten() for d in dicts_pred])
+            y_true = np.array(gt_dict[key]).flatten()
+            y_pred = np.array(pred_dict[key]).flatten()
 
             title = f"{key} ({stage_name.capitalize()} Stage)"
             if self.show_rmse:
@@ -157,16 +162,33 @@ class TensorGraphParityPlotter(GraphParityPlotter):
     @override
     def _plot_combined_all_stages(self, trainer):
         """
-        Override for tensors: modifies the single request in a loop over the requested tensor properties.
+        Override for tensors: computes properties once per stage 
+        and generates the final combined parity plots.
         """
+        # 1. Pre-calcoliamo le proprietà per ogni stage presente in data_store
+        computed_stages = {}
+        for stage, _, _ in self.COLOR_CFG:
+            raw_gt_list, raw_pred_list = self.data_store[stage]
+            if raw_gt_list: # Se ci sono dati accumulati per questo stage
+                # Concatena i batch grezzi NumPy
+                all_gt = np.concatenate(raw_gt_list, axis=0)
+                all_pred = np.concatenate(raw_pred_list, axis=0)
+                
+                # Calcola le proprietà una sola volta per lo stage attuale usando JAX
+                computed_stages[stage] = {
+                    "gt": self._compute_all_properties(jnp.array(all_gt)),
+                    "pred": self._compute_all_properties(jnp.array(all_pred))
+                }
+
+        # 2. Ora cicliamo sulle proprietà per fare i grafici combinati finali
         for key in self.properties_keys:
             stage_data = {}
-            for stage, _, _ in self.COLOR_CFG:
-                true_list, pred_list = self.data_store[stage]
-                if true_list:
-                    y_true = np.concatenate([np.array(d[key]).flatten() for d in true_list])
-                    y_pred = np.concatenate([np.array(d[key]).flatten() for d in pred_list])
-                    stage_data[stage] = (y_true, y_pred)
+            
+            for stage in computed_stages.keys():
+                # Estraiamo gli array già calcolati dal dizionario e facciamo il flatten
+                y_true = np.array(computed_stages[stage]["gt"][key]).flatten()
+                y_pred = np.array(computed_stages[stage]["pred"][key]).flatten()
+                stage_data[stage] = (y_true, y_pred)
             
             if stage_data:
                 save_dir = self._get_save_dir(trainer) / "combined_final"
@@ -179,6 +201,7 @@ class TensorGraphParityPlotter(GraphParityPlotter):
                         rmse_strs.append(f"{stage.capitalize()} RMSE: {rmse:.4f}")
                     title += " | " + " - ".join(rmse_strs)
                 
+                # Rispettiamo l'assegnazione delle etichette dinamiche
                 self._x_label = f"True {key}"
                 self._y_label = f"Predicted {key}"
                 

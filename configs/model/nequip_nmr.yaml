@@ -22,7 +22,10 @@ optimizer:
   _args_:
     - _target_: optax.contrib.reduce_on_plateau
       factor: 0.9                      
-      patience: 50                    
+      patience: 20
+      rtol: 0.0001         
+      atol: 0.001         
+      cooldown: 5        
       min_scale: 1.0e-6
     - _target_: optax.adam
       learning_rate: 0.1 
