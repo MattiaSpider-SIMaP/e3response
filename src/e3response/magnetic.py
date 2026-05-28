@@ -68,7 +68,7 @@ class MagneticShieldingTensor(linen.Module):
     B^{k}_ind to an applied external magnetic field B_ext.
 
     The Jacobian is computed as:
-        σ_{k, ij} = - ∂B_ind_{k, i} / ∂B_ext_j
+        σ_{k, ij} = ∂B_ind_{k, i} / ∂B_ext_j
 
     Returns:
         A graph where each node has a (3, 3) tensor stored in `out_field`.
@@ -93,12 +93,11 @@ class MagneticShieldingTensor(linen.Module):
 
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
         B_ext_zeros = jnp.zeros_like(graph.globals[self.B_ext])
-        derivative, graph = self._diff_fn(
+        shielding, graph = self._diff_fn(
             graph,
             B_ext_zeros,
         )
         
-        shielding = -derivative
         graph = (
             gcnn.experimental.update_graph(graph)
             .set(("nodes", self.out_key), shielding)
@@ -107,7 +106,7 @@ class MagneticShieldingTensor(linen.Module):
         
         # print("graph nodes keys:", graph.nodes.keys())
         # print("graph globals keys:", graph.globals.keys())
-        print("predicted_induced_magnetic_field:", graph.nodes["predicted_induced_magnetic_field"])
+        # print("predicted_induced_magnetic_field:", graph.nodes["predicted_induced_magnetic_field"])
 
         # print("external magnetic field shape:", graph.globals["external_magnetic_field"].shape)
 
