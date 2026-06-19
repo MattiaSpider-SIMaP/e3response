@@ -43,6 +43,7 @@ class InducedMagneticField(linen.Module):
             ],
             out=":Iα",  # Result: (N_atomi, 3) = B_ind
             return_graph=True,
+            mode="fwd",
         )
     
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
@@ -89,6 +90,7 @@ class MagneticShieldingTensor(linen.Module):
             ],
             out=":Iγα",
             return_graph=True,
+            mode="fwd",
         )
 
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
