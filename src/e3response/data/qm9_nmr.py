@@ -20,6 +20,7 @@ from pymatgen.io import gaussian  # type: ignore
 import pymatgen.io.ase  # type: ignore
 import reax
 from tensorial import gcnn
+from tensorial.gcnn import atomic
 import tqdm
 from typing_extensions import override
 
@@ -119,7 +120,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
             gcnn.atomic.graph_from_ase,
             r_max=self._rmax,
             atom_include_keys=("numbers", *self._atom_keys),
-            global_include_keys=[keys.EXTERNAL_MAGNETIC_FIELD],
+            global_include_keys=[keys.EXTERNAL_MAGNETIC_FIELD, atomic.TOTAL_ENERGY],
         )
 
         # Data
@@ -253,6 +254,12 @@ def _create_molecule_data(log_file):
             r"Eigenvalues:\s+([-\d\.]+)\s+([-\d\.]+)\s+([-\d\.]+)"  # eigenvalues
         )
 
+        energy_pattern = r"SCF Done:\s+E\([^)]+\)\s+=\s+([-\d\.]+)\s+A\.U\."
+        energy_match = re.search(energy_pattern, log_data)
+        if energy_match is None:
+            raise ValueError(f"File {log_file} does not contain SCF energy.")
+        energy = float(energy_match.group(1))
+
         matches = re.findall(shielding_pattern, log_data)
 
         atom_list = []
@@ -284,6 +291,7 @@ def _create_molecule_data(log_file):
         # final dictionary
         molecule_data = {
             "structure": structure,
+            "energy": energy,
             **{
                 key: [atom[key] for atom in atom_list]
                 for key in ["tensor", "isotropic", "anisotropy", "eigenvalues", "species"]
@@ -334,6 +342,7 @@ def get_structure_and_data_from_log(log_path: pathlib.Path) -> ase.Atoms | None:
         mu_values = np.array([mu_dict[s] for s in species])
         atoms.arrays["mu"] = mu_values
         atoms.arrays[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
+        atoms.arrays[atomic.TOTAL_ENERGY] = np.array(molecule_data["energy"])
 
         # print(atoms.arrays["mu"])
 
