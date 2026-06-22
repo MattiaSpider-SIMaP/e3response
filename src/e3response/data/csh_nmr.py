@@ -20,6 +20,7 @@ class CshNmrDataModule(reax.DataModule):
     """Calcium Silicate Hydrate dataset from pre-processed pickle file containing ASE atoms objects with NMR tensor data."""
 
     _max_padding: gcnn.data.GraphPadding = None
+    _BULK_CUTOFF: int = 277  # structures at indices < this are bulk; the rest are surface
 
     def __init__(
         self,
@@ -51,14 +52,30 @@ class CshNmrDataModule(reax.DataModule):
 
         structures = self._load_structures()
 
-        train, val, test = reax.data.random_split(
-            stage.rng, dataset=structures, lengths=self._train_val_test_split
-        )
+        bulk = structures[: self._BULK_CUTOFF]
+        surface = structures[self._BULK_CUTOFF :]
+
+        if surface:
+            # Stratified split: apply the same ratio to bulk and surface separately
+            # so every partition contains a balanced mix of both structure types.
+            b_train, b_val, b_test = reax.data.random_split(
+                stage.rngs, dataset=bulk, lengths=self._train_val_test_split
+            )
+            s_train, s_val, s_test = reax.data.random_split(
+                stage.rngs, dataset=surface, lengths=self._train_val_test_split
+            )
+            train = list(b_train) + list(s_train)
+            val = list(b_val) + list(s_val)
+            test = list(b_test) + list(s_test)
+        else:
+            train, val, test = reax.data.random_split(
+                stage.rngs, dataset=structures, lengths=self._train_val_test_split
+            )
 
         to_graph: Callable[[Atoms], jraph.GraphsTuple] = lambda atoms: gcnn.atomic.graph_from_ase(
             atoms,
             r_max=self._rmax,
-            atom_include_keys=("numbers", "NMR_tensors", "mask"),
+            atom_include_keys=("numbers", "nmr_tensors", "mask"),
             global_include_keys=[],
         )
 
@@ -91,7 +108,7 @@ class CshNmrDataModule(reax.DataModule):
         actual_limit = None
         if isinstance(self._limit, str):
             if self._limit.lower() == "only bulk":
-                actual_limit = 277
+                actual_limit = self._BULK_CUTOFF
             else:
                 raise ValueError(f"Unknown limit option: {self._limit}")
         else:
@@ -105,7 +122,7 @@ class CshNmrDataModule(reax.DataModule):
         return structures
 
     @override
-    def train_dataloader(self) -> reax.DataLoader[Any]:
+    def train_dataloader(self) -> reax.DataLoader:
         if self.data_train is None:
             raise reax.exceptions.MisconfigurationException("Call setup() before dataloader.")
         return gcnn.data.GraphLoader(
@@ -116,7 +133,7 @@ class CshNmrDataModule(reax.DataModule):
         )
 
     @override
-    def val_dataloader(self) -> reax.DataLoader[Any]:
+    def val_dataloader(self) -> reax.DataLoader:
         if self.data_val is None:
             raise reax.exceptions.MisconfigurationException("Call setup() before dataloader.")
         return gcnn.data.GraphLoader(
@@ -128,7 +145,7 @@ class CshNmrDataModule(reax.DataModule):
         )
 
     @override
-    def test_dataloader(self) -> reax.DataLoader[Any]:
+    def test_dataloader(self) -> reax.DataLoader:
         if self.data_test is None:
             raise reax.exceptions.MisconfigurationException("Call setup() before dataloader.")
         return gcnn.data.GraphLoader(
