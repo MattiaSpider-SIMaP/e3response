@@ -1,11 +1,15 @@
+import collections
 import functools
+import json
 import logging
 import pathlib
-import pickle
 from typing import Any, Callable, Final, Optional, Sequence, Union
 
 from ase import Atoms
 import jraph
+from monty.json import MontyDecoder
+import numpy as np
+import pymatgen.io.ase
 import reax
 from tensorial import gcnn
 from typing_extensions import override
@@ -18,14 +22,14 @@ __all__ = ("SiNmrDataModule",)
 
 
 class SiNmrDataModule(reax.DataModule):
-    """Silicon dataset from pre-processed pickle file containing ASE atoms objects with tensor data."""
+    """Silicon dataset containing ASE atoms objects with nmr tensors per Silicon atom, nmr active atoms mask annd Q_n classification."""
 
     _max_padding: gcnn.data.GraphPadding = None
 
     def __init__(
         self,
         r_max: float,
-        data_file: Union[str, pathlib.Path] = "data/si_nmr/Si_dataset.pkl",
+        data_file: Union[str, pathlib.Path] = "data/si_nmr/si_data.json",
         train_val_test_split: Sequence[Union[int, float]] = (0.8, 0.1, 0.1),
         batch_size: int = 64,
         limit: Optional[int] = None,
@@ -52,16 +56,30 @@ class SiNmrDataModule(reax.DataModule):
 
         structures = self._load_structures()
 
-        train, val, test = reax.data.random_split(
-            stage.rng, dataset=structures, lengths=self._train_val_test_split
-        )
+        # Group structures by their Qn signature and split each group independently
+        # so every partition contains the same ratio of Q classes.
+        groups: dict[tuple, list] = collections.defaultdict(list)
+        for atoms in structures:
+            label = tuple(sorted(set(atoms.arrays.get("Qn", []))))
+            groups[label].append(atoms)
+
+        all_train, all_val, all_test = [], [], []
+        for group in groups.values():
+            g_train, g_val, g_test = reax.data.random_split(
+                stage.rngs, dataset=group, lengths=self._train_val_test_split
+            )
+            all_train.extend(list(g_train))
+            all_val.extend(list(g_val))
+            all_test.extend(list(g_test))
+
+        train, val, test = all_train, all_val, all_test
 
         to_graph: Callable[[Atoms], jraph.GraphsTuple] = lambda atoms: gcnn.atomic.graph_from_ase(
             atoms,
             r_max=self._rmax,
-            atom_include_keys=("numbers", "NMR", "mask"),
+            atom_include_keys=("numbers", "nmr_tensors", "mask"),
             global_include_keys=[],
-            key_mapping={"NMR": "NMR_tensors", "mask": "nmr_active"},
+            key_mapping={"mask": "nmr_active"},
         )
 
         train_graphs = list(map(to_graph, train))
@@ -84,21 +102,36 @@ class SiNmrDataModule(reax.DataModule):
         path = pathlib.Path(self._data_file)
         _LOGGER.info("Loading dataset from %s", path.absolute())
 
-        with open(path, "rb") as file:
-            structures = pickle.load(file)
+        with open(path, encoding="utf-8") as f:
+            entries = json.load(f, cls=MontyDecoder)
 
-        if not isinstance(structures, list) or not all(isinstance(s, Atoms) for s in structures):
-            raise ValueError("Pickle file does not contain a list of `ase.Atoms` objects.")
+        structures = []
+        for entry in entries:
+            atoms = pymatgen.io.ase.AseAtomsAdaptor.get_atoms(entry["structure"])
+
+            ind = entry["ind"]
+            n_atoms = entry["N"]
+
+            tensors = np.zeros((n_atoms, 3, 3))
+            tensors[ind] = entry["tensor"]
+
+            mask = np.zeros(n_atoms, dtype=bool)
+            mask[ind] = True
+
+            atoms.arrays["nmr_tensors"] = tensors
+            atoms.arrays["mask"] = mask
+            atoms.arrays["Qn"] = entry["Qn"]
+
+            structures.append(atoms)
 
         if self._limit is not None:
             structures = structures[: self._limit]
 
-        _LOGGER.info(f"Number of loaded structures: {len(structures)}")
-
+        _LOGGER.info("Number of loaded structures: %d", len(structures))
         return structures
 
     @override
-    def train_dataloader(self) -> reax.DataLoader[Any]:
+    def train_dataloader(self) -> reax.DataLoader:
         if self.data_train is None:
             raise reax.exceptions.MisconfigurationException("Call setup() before dataloader.")
         return gcnn.data.GraphLoader(
@@ -109,7 +142,7 @@ class SiNmrDataModule(reax.DataModule):
         )
 
     @override
-    def val_dataloader(self) -> reax.DataLoader[Any]:
+    def val_dataloader(self) -> reax.DataLoader:
         if self.data_val is None:
             raise reax.exceptions.MisconfigurationException("Call setup() before dataloader.")
         return gcnn.data.GraphLoader(
@@ -121,7 +154,7 @@ class SiNmrDataModule(reax.DataModule):
         )
 
     @override
-    def test_dataloader(self) -> reax.DataLoader[Any]:
+    def test_dataloader(self) -> reax.DataLoader:
         if self.data_test is None:
             raise reax.exceptions.MisconfigurationException("Call setup() before dataloader.")
         return gcnn.data.GraphLoader(
