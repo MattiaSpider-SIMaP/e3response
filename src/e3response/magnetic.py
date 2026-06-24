@@ -1,15 +1,9 @@
-from collections.abc import Callable
-from typing import Union
-
 from flax import linen
-import jax
 import jax.numpy as jnp
-import jaxtyping as jt
 import jraph
 from tensorial import gcnn
 from tensorial.gcnn import atomic
 from tensorial.gcnn.keys import predicted
-import tensorial.typing as tt
 
 from . import keys
 
@@ -32,16 +26,12 @@ class InducedMagneticField(linen.Module):
     out_key: str = predicted(keys.INDUCED_MAGNETIC_FIELD)
     
     def setup(self) -> None:
-        # Diff E against μ (per-node)
-        self._diff_E_wrt_mu = gcnn.experimental.diff(
+        # Diff E against μ (per-node). No at= — shape (N_atoms, 3) unknown at setup time.
+        self._diff_E_wrt_mu = gcnn.diff(
             self.energy_fn,
-            # Output: energy (globale)
             f"globals.{self.energy_key}:g",
-            wrt=[
-                # Input: μ per-nodo
-                f"nodes.{self.mu_key}:Iα",  # (N_atomi, 3)
-            ],
-            out=":Iα",  # Result: (N_atomi, 3) = B_ind
+            wrt=[f"nodes.{self.mu_key}:Iα"],
+            out=":Iα",
             return_graph=True,
             mode="fwd",
         )
@@ -79,42 +69,40 @@ class MagneticShieldingTensor(linen.Module):
     B_ind: str = predicted(keys.INDUCED_MAGNETIC_FIELD)
     B_ext: str = keys.EXTERNAL_MAGNETIC_FIELD
     out_key: str = predicted(keys.NMR_TENSORS)
+    B_ext_at_graph: bool = False  # if True, evaluate Jacobian at graph.globals[B_ext]; else at zero
 
     def setup(self) -> None:
-        
-        self._diff_fn = gcnn.experimental.diff(
-            self.B_ind_fn,
-            f"nodes.{self.B_ind}:Iγ",
-            wrt=[
-                f"globals.{self.B_ext}:gα",
-            ],
-            out=":Iγα",
-            return_graph=True,
-            mode="fwd",
-        )
+        if self.B_ext_at_graph:
+            # Dynamic eval point (e.g. for path-integral analysis): no at=, passed at call time.
+            self._diff_fn = gcnn.diff(
+                self.B_ind_fn,
+                f"nodes.{self.B_ind}:Iγ",
+                wrt=[f"globals.{self.B_ext}:gα"],
+                out=":Iγα",
+                return_graph=True,
+                mode="fwd",
+            )
+        else:
+            # Standard case: evaluate Jacobian at B_ext = 0.
+            self._diff_fn = gcnn.diff(
+                self.B_ind_fn,
+                f"nodes.{self.B_ind}:Iγ",
+                wrt=[f"globals.{self.B_ext}:gα"],
+                at={f"globals.{self.B_ext}": jnp.zeros(3)},
+                out=":Iγα",
+                return_graph=True,
+                mode="fwd",
+            )
 
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        B_ext_zeros = jnp.zeros_like(graph.globals[self.B_ext])
-        shielding, graph = self._diff_fn(
-            graph,
-            B_ext_zeros,
-        )
+        if self.B_ext_at_graph:
+            shielding, graph = self._diff_fn(graph, graph.globals[self.B_ext])
+        else:
+            shielding, graph = self._diff_fn(graph)
         
         graph = (
             gcnn.experimental.update_graph(graph)
             .set(("nodes", self.out_key), shielding)
             .get()
         )
-        
-        # print("graph nodes keys:", graph.nodes.keys())
-        # print("graph globals keys:", graph.globals.keys())
-        # print("predicted_induced_magnetic_field:", graph.nodes["predicted_induced_magnetic_field"])
-
-        # print("external magnetic field shape:", graph.globals["external_magnetic_field"].shape)
-
-        # print("predicted induced magnetic field shape:", graph.nodes["predicted_induced_magnetic_field"].shape)
-
-        # print("nmr tensors shape:", graph.nodes["nmr_tensors"].shape)
-        # print("predicted nmr tensors shape:", graph.nodes["predicted_nmr_tensors"].shape)
-
         return graph
