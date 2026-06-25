@@ -72,33 +72,20 @@ class MagneticShieldingTensor(linen.Module):
     B_ext_at_graph: bool = False  # if True, evaluate Jacobian at graph.globals[B_ext]; else at zero
 
     def setup(self) -> None:
-        if self.B_ext_at_graph:
-            # Dynamic eval point (e.g. for path-integral analysis): no at=, passed at call time.
-            self._diff_fn = gcnn.diff(
-                self.B_ind_fn,
-                f"nodes.{self.B_ind}:Iγ",
-                wrt=[f"globals.{self.B_ext}:gα"],
-                out=":Iγα",
-                return_graph=True,
-                mode="fwd",
-            )
-        else:
-            # Standard case: evaluate Jacobian at B_ext = 0.
-            self._diff_fn = gcnn.diff(
-                self.B_ind_fn,
-                f"nodes.{self.B_ind}:Iγ",
-                wrt=[f"globals.{self.B_ext}:gα"],
-                at={f"globals.{self.B_ext}": jnp.zeros(3)},
-                out=":Iγα",
-                return_graph=True,
-                mode="fwd",
-            )
+        # B_ext is always passed explicitly at call time (zeros or graph value).
+        # This avoids hardcoding shape in at=, which would break for varying batch sizes.
+        self._diff_fn = gcnn.diff(
+            self.B_ind_fn,
+            f"nodes.{self.B_ind}:Iγ",
+            wrt=[f"globals.{self.B_ext}:gα"],
+            out=":Iγα",
+            return_graph=True,
+            mode="fwd",
+        )
 
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        if self.B_ext_at_graph:
-            shielding, graph = self._diff_fn(graph, graph.globals[self.B_ext])
-        else:
-            shielding, graph = self._diff_fn(graph)
+        B_ext_val = graph.globals[self.B_ext] if self.B_ext_at_graph else jnp.zeros_like(graph.globals[self.B_ext])
+        shielding, graph = self._diff_fn(graph, B_ext_val)
         
         graph = (
             gcnn.experimental.update_graph(graph)
