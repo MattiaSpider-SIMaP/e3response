@@ -1,10 +1,12 @@
+import collections
+import json
 import logging
 import pathlib
-import pickle
 from typing import Any, Callable, Final, Optional, Sequence, Union
 
 from ase import Atoms
 import jraph
+import numpy as np
 import reax
 from tensorial import gcnn
 from typing_extensions import override
@@ -17,15 +19,14 @@ __all__ = ("CshNmrDataModule",)
 
 
 class CshNmrDataModule(reax.DataModule):
-    """Calcium Silicate Hydrate dataset from pre-processed pickle file containing ASE atoms objects with NMR tensor data."""
+    """Calcium Silicate Hydrate dataset from a pre-processed JSON file containing ASE atoms objects with NMR tensor data."""
 
     _max_padding: gcnn.data.GraphPadding = None
-    _BULK_CUTOFF: int = 277  # structures at indices < this are bulk; the rest are surface
 
     def __init__(
         self,
         r_max: float,
-        data_file: Union[str, pathlib.Path] = "data/csh_nmr/csh_dataset.pkl",
+        data_file: Union[str, pathlib.Path] = "data/csh_nmr/Na_csh.json",
         train_val_test_split: Sequence[Union[int, float]] = (0.8, 0.1, 0.1),
         batch_size: int = 64,
         limit: Optional[Union[int, str]] = None,
@@ -52,25 +53,20 @@ class CshNmrDataModule(reax.DataModule):
 
         structures = self._load_structures()
 
-        bulk = structures[: self._BULK_CUTOFF]
-        surface = structures[self._BULK_CUTOFF :]
+        # Group structures by struct_type ("bulk"/"surf") and split each group
+        # independently so every partition contains the same ratio of each type.
+        groups: dict[str, list[Atoms]] = collections.defaultdict(list)
+        for atoms in structures:
+            groups[atoms.info.get("struct_type")].append(atoms)
 
-        if surface:
-            # Stratified split: apply the same ratio to bulk and surface separately
-            # so every partition contains a balanced mix of both structure types.
-            b_train, b_val, b_test = reax.data.random_split(
-                stage.rngs, dataset=bulk, lengths=self._train_val_test_split
+        train, val, test = [], [], []
+        for group in groups.values():
+            g_train, g_val, g_test = reax.data.random_split(
+                stage.rngs, dataset=group, lengths=self._train_val_test_split
             )
-            s_train, s_val, s_test = reax.data.random_split(
-                stage.rngs, dataset=surface, lengths=self._train_val_test_split
-            )
-            train = list(b_train) + list(s_train)
-            val = list(b_val) + list(s_val)
-            test = list(b_test) + list(s_test)
-        else:
-            train, val, test = reax.data.random_split(
-                stage.rngs, dataset=structures, lengths=self._train_val_test_split
-            )
+            train.extend(list(g_train))
+            val.extend(list(g_val))
+            test.extend(list(g_test))
 
         to_graph: Callable[[Atoms], jraph.GraphsTuple] = lambda atoms: gcnn.atomic.graph_from_ase(
             atoms,
@@ -99,27 +95,40 @@ class CshNmrDataModule(reax.DataModule):
         path = pathlib.Path(self._data_file)
         _LOGGER.info("Loading dataset from %s", path.absolute())
 
-        with open(path, "rb") as file:
-            structures = pickle.load(file)
+        with open(path, encoding="utf-8") as file:
+            entries = json.load(file)
 
-        if not isinstance(structures, list) or not all(isinstance(s, Atoms) for s in structures):
-            raise ValueError("Pickle file does not contain a list of `ase.Atoms` objects.")
+        structures = [self._entry_to_atoms(entry) for entry in entries]
 
-        actual_limit = None
         if isinstance(self._limit, str):
-            if self._limit.lower() == "only bulk":
-                actual_limit = self._BULK_CUTOFF
+            limit_lower = self._limit.lower()
+            if limit_lower == "only bulk":
+                structures = [s for s in structures if s.info.get("struct_type") == "bulk"]
+            elif limit_lower == "only surface":
+                structures = [s for s in structures if s.info.get("struct_type") == "surf"]
             else:
                 raise ValueError(f"Unknown limit option: {self._limit}")
-        else:
-            actual_limit = self._limit
+        elif self._limit is not None:
+            structures = structures[: self._limit]
 
-        if actual_limit is not None:
-            structures = structures[:actual_limit]
-
-        _LOGGER.info(f"Number of loaded structures: {len(structures)}")
+        _LOGGER.info("Number of loaded structures: %d", len(structures))
 
         return structures
+
+    @staticmethod
+    def _entry_to_atoms(entry: dict[str, Any]) -> Atoms:
+        atoms = Atoms(
+            numbers=entry["numbers"],
+            positions=entry["positions"],
+            cell=entry["cell"],
+            pbc=entry["pbc"],
+        )
+        atoms.arrays["nmr_tensors"] = np.asarray(entry["nmr_tensors"])
+        atoms.arrays["mask"] = np.asarray(entry["mask"], dtype=bool)
+        atoms.info["struct_type"] = entry.get("struct_type")
+        atoms.info["ca_si_ratio"] = entry.get("ca_si_ratio")
+        atoms.info["energy_Ry"] = entry.get("energy_Ry")
+        return atoms
 
     @override
     def train_dataloader(self) -> reax.DataLoader:

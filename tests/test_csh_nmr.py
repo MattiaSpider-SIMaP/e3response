@@ -1,38 +1,45 @@
-import pickle
+import json
 from pathlib import Path
 
-import ase
 import numpy as np
 import pytest
 import reax
 
 from e3response.data.csh_nmr import CshNmrDataModule
 
-# Mock dataset constants: 5 bulk + 5 surface, cutoff overridden via monkeypatch
-_MOCK_BULK_CUTOFF = 5
-_MOCK_N_STRUCTURES = 10
+# Mock dataset constants: 5 bulk + 5 surf structures
+_MOCK_N_BULK = 5
+_MOCK_N_SURF = 5
+_MOCK_N_STRUCTURES = _MOCK_N_BULK + _MOCK_N_SURF
 
 
-def _make_atoms(seed: int = 0, n_atoms: int = 3) -> ase.Atoms:
-    """Minimal Atoms object with the arrays expected by CshNmrDataModule."""
+def _make_entry(seed: int, struct_type: str, n_atoms: int = 3) -> dict:
+    """Minimal JSON entry with the fields expected by CshNmrDataModule."""
     rng = np.random.default_rng(seed)
-    atoms = ase.Atoms(
-        "H" * n_atoms,
-        positions=rng.random((n_atoms, 3)) * 2.0,  # kept within r_max=3.0
-    )
-    atoms.arrays["nmr_tensors"] = rng.random((n_atoms, 3, 3))
-    atoms.arrays["mask"] = np.ones(n_atoms, dtype=bool)
-    return atoms
+    return {
+        "numbers": [1] * n_atoms,
+        "positions": (rng.random((n_atoms, 3)) * 2.0).tolist(),  # kept within r_max=3.0
+        "cell": np.zeros((3, 3)).tolist(),
+        "pbc": [False, False, False],
+        "nmr_tensors": rng.random((n_atoms, 3, 3)).tolist(),
+        "mask": [True] * n_atoms,
+        "struct_type": struct_type,
+        "ca_si_ratio": 1.0,
+        "energy_Ry": -100.0,
+    }
 
 
 @pytest.fixture
-def mock_csh_pkl(tmp_path: Path) -> Path:
-    """Pickle file with 10 fake Atoms objects (indices 0-4 = bulk, 5-9 = surface)."""
-    structures = [_make_atoms(seed=i) for i in range(_MOCK_N_STRUCTURES)]
-    pkl_path = tmp_path / "csh_dataset.pkl"
-    with open(pkl_path, "wb") as f:
-        pickle.dump(structures, f)
-    return pkl_path
+def mock_csh_json(tmp_path: Path) -> Path:
+    """JSON file with 5 bulk + 5 surf fake entries."""
+    entries = [_make_entry(seed=i, struct_type="bulk") for i in range(_MOCK_N_BULK)]
+    entries += [
+        _make_entry(seed=_MOCK_N_BULK + i, struct_type="surf") for i in range(_MOCK_N_SURF)
+    ]
+    json_path = tmp_path / "csh_dataset.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(entries, f)
+    return json_path
 
 
 class _DummyStage(reax.Stage):
@@ -46,13 +53,11 @@ class _DummyStage(reax.Stage):
         pass
 
 
-def test_csh_nmr_datamodule_full_dataset_stratified(mock_csh_pkl, test_engine, monkeypatch):
-    """Full dataset: both bulk and surface structures appear in every partition."""
-    monkeypatch.setattr(CshNmrDataModule, "_BULK_CUTOFF", _MOCK_BULK_CUTOFF)
-
+def test_csh_nmr_datamodule_full_dataset_stratified(mock_csh_json, test_engine):
+    """Full dataset: both bulk and surf structures appear in every partition."""
     dm = CshNmrDataModule(
         r_max=3.0,
-        data_file=mock_csh_pkl,
+        data_file=mock_csh_json,
         train_val_test_split=(0.6, 0.2, 0.2),
         batch_size=1,
     )
@@ -70,20 +75,18 @@ def test_csh_nmr_datamodule_full_dataset_stratified(mock_csh_pkl, test_engine, m
     assert n_val > 0, "val partition is empty"
     assert n_test > 0, "test partition is empty"
 
-    # With stratified 60/20/20 on 5 bulk + 5 surface:
-    # each group gives (3, 1, 1) → totals (6, 2, 2)
+    # With stratified 60/20/20 on 5 bulk + 5 surf:
+    # each group gives (3, 1, 1) -> totals (6, 2, 2)
     assert n_train == 6
     assert n_val == 2
     assert n_test == 2
 
 
-def test_csh_nmr_datamodule_only_bulk(mock_csh_pkl, test_engine, monkeypatch):
-    """limit='only bulk' loads only the first _BULK_CUTOFF structures."""
-    monkeypatch.setattr(CshNmrDataModule, "_BULK_CUTOFF", _MOCK_BULK_CUTOFF)
-
+def test_csh_nmr_datamodule_only_bulk(mock_csh_json, test_engine):
+    """limit='only bulk' loads only the bulk structures."""
     dm = CshNmrDataModule(
         r_max=3.0,
-        data_file=mock_csh_pkl,
+        data_file=mock_csh_json,
         train_val_test_split=(0.6, 0.2, 0.2),
         batch_size=1,
         limit="only bulk",
@@ -91,18 +94,33 @@ def test_csh_nmr_datamodule_only_bulk(mock_csh_pkl, test_engine, monkeypatch):
     dm.setup(_DummyStage(test_engine))
 
     total = len(dm.data_train) + len(dm.data_val) + len(dm.data_test)
-    assert total == _MOCK_BULK_CUTOFF, (
-        f"Expected {_MOCK_BULK_CUTOFF} structures with 'only bulk', got {total}"
+    assert total == _MOCK_N_BULK, (
+        f"Expected {_MOCK_N_BULK} structures with 'only bulk', got {total}"
     )
 
 
-def test_csh_nmr_dataloaders(mock_csh_pkl, test_engine, monkeypatch):
-    """All three dataloaders yield valid graph batches with the expected fields."""
-    monkeypatch.setattr(CshNmrDataModule, "_BULK_CUTOFF", _MOCK_BULK_CUTOFF)
-
+def test_csh_nmr_datamodule_only_surface(mock_csh_json, test_engine):
+    """limit='only surface' loads only the surf structures."""
     dm = CshNmrDataModule(
         r_max=3.0,
-        data_file=mock_csh_pkl,
+        data_file=mock_csh_json,
+        train_val_test_split=(0.6, 0.2, 0.2),
+        batch_size=1,
+        limit="only surface",
+    )
+    dm.setup(_DummyStage(test_engine))
+
+    total = len(dm.data_train) + len(dm.data_val) + len(dm.data_test)
+    assert total == _MOCK_N_SURF, (
+        f"Expected {_MOCK_N_SURF} structures with 'only surface', got {total}"
+    )
+
+
+def test_csh_nmr_dataloaders(mock_csh_json, test_engine):
+    """All three dataloaders yield valid graph batches with the expected fields."""
+    dm = CshNmrDataModule(
+        r_max=3.0,
+        data_file=mock_csh_json,
         train_val_test_split=(0.6, 0.2, 0.2),
         batch_size=1,
     )
