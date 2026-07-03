@@ -51,6 +51,29 @@ mu_dict = {
 }
 
 
+def _parse_limit(limit: int | str | None) -> slice:
+    """Convert a limit spec to a slice over a sorted file list.
+
+    - None       → slice(None)       (all files)
+    - int N      → slice(None, N)    (first N files)
+    - "a:b"      → slice(a, b)       (files a through b-1)
+    - "a:b:s"    → slice(a, b, s)    (with step)
+    """
+    if limit is None:
+        return slice(None)
+    if isinstance(limit, int):
+        return slice(None, limit)
+    parts = limit.split(":")
+    indices = [int(p) if p else None for p in parts]
+    if len(indices) == 2:
+        return slice(indices[0], indices[1])
+    if len(indices) == 3:
+        return slice(indices[0], indices[1], indices[2])
+    raise ValueError(
+        f"Cannot parse limit {limit!r}: expected int, 'start:stop', or 'start:stop:step'"
+    )
+
+
 class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
     """
     QM9-NMR dataset in different solvents containing graphs
@@ -63,7 +86,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         data_dir: str | pathlib.Path = "data/qm9_nmr/",
         dataset: str | Sequence[str] = "gasphase",
         atom_keys: str | Sequence[str] | None = None,
-        limit: int | None = None,
+        limit: int | str | None = None,
     ) -> None:
         """
         Initialize the QM9-NMR dataset.
@@ -73,7 +96,13 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         :param dataset: List of dataset names containing gaussian raw data.
         :param tensors: Name(s) of tensor(s) to extract, either a string
                         (for one tensor) or a list/tuple of strings.
-        :param limit: Maximum number of structures to load as graphs.
+        :param limit: Controls which structures to load from the archive
+            (files are sorted by name before slicing, so indices are stable):
+            - None  → all structures
+            - int N → first N structures (equivalent to ``"0:N"``)
+            - str "start:stop" or "start:stop:step" → Python-slice semantics,
+              e.g. ``"10000:10020"`` loads only those 20 structures and the
+              resulting dataset has indices 0–19.
         """
         super().__init__()
 
@@ -192,32 +221,24 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         except OSError as e:
             _LOGGER.error("Filesystem error while writing %s: %s", path, e)
 
-    def _extract_archive_zip(self, zip_path: str, limit: int | None = None) -> list:
-
+    def _extract_archive_zip(self, zip_path: str, limit: int | str | None = None) -> list:
         structures = []
+        limit_slice = _parse_limit(limit)
 
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
-
-            # selecting .log files
-            log_files = [f for f in zip_ref.namelist() if f.endswith(".log")]
+            # Sort so that integer-range limits have stable, reproducible semantics.
+            log_files = sorted(f for f in zip_ref.namelist() if f.endswith(".log"))
+            log_files = log_files[limit_slice]
 
             for log_file in tqdm.tqdm(log_files, desc="EXTRACT ZIP"):
-
-                if limit is not None and len(structures) >= limit:
-                    break
-
-                # reading content as bytes
                 data = zip_ref.read(log_file)
-
-                # saving on temporary file -> needed for gaussian structure extraction
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".log", encoding="utf-8"
                 ) as tmp_log:
                     tmp_log.write(data.decode("utf-8"))
+                    # flush before reading back by path, or the log may still be empty
                     tmp_log.flush()
-                    tmp_log_path = tmp_log.name
-
-                    structures.append(get_structure_and_data_from_log(pathlib.Path(tmp_log_path)))
+                    structures.append(get_structure_and_data_from_log(pathlib.Path(tmp_log.name)))
 
         return structures
 
@@ -367,7 +388,7 @@ class Qm9NmrDataModule(reax.DataModule):
         data_dir: str | pathlib.Path = "data/qm9_nmr/",
         dataset: str | Sequence[str] = "gasphase",
         atom_keys: Sequence[str] | None = None,
-        limit: int | None = None,
+        limit: int | str | None = None,
         train_val_test_split: Sequence[int | float] = (0.85, 0.05, 0.1),
         batch_size: int = 64,
     ) -> None:
