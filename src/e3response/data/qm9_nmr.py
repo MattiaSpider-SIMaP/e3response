@@ -14,6 +14,7 @@ import urllib.request
 import zipfile
 
 import ase
+from flax import nnx
 import jraph
 import numpy as np
 from pymatgen.io import gaussian  # type: ignore
@@ -29,6 +30,10 @@ from e3response import keys
 __all__ = ("Qm9NmrDataset", "Qm9NmrDataModule")
 
 _LOGGER = logging.getLogger(__name__)
+
+# Archive paths whose integrity has already been verified in this process, so the
+# expensive ``testzip`` scan runs at most once per archive (see `_ensure_archive`).
+_VALIDATED_ARCHIVES: set[str] = set()
 
 
 # QM9 NMR datasets
@@ -87,6 +92,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         dataset: str | Sequence[str] = "gasphase",
         atom_keys: str | Sequence[str] | None = None,
         limit: int | str | None = None,
+        indices: Sequence[int] | None = None,
     ) -> None:
         """
         Initialize the QM9-NMR dataset.
@@ -103,6 +109,11 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
             - str "start:stop" or "start:stop:step" → Python-slice semantics,
               e.g. ``"10000:10020"`` loads only those 20 structures and the
               resulting dataset has indices 0–19.
+        :param indices: If given, restrict the dataset to exactly these positions
+            within the `limit`-selected file list (e.g. the scattered indices of one
+            train/val/test split — see `Qm9NmrDataModule.load_split`). Only the
+            selected ``.log`` files are read/parsed. ``None`` (default) loads everything in
+            `limit`.
         """
         super().__init__()
 
@@ -152,34 +163,19 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
             global_include_keys=[keys.EXTERNAL_MAGNETIC_FIELD, atomic.TOTAL_ENERGY],
         )
 
-        # Data
-        self._data = []
+        # Data: collect (archive_path, log_file) pairs across all requested archives,
+        # honouring `limit` per archive (as before), then optionally sub-select
+        # `indices` BEFORE reading/parsing anything.
+        archive_log_pairs: list[tuple[str, str]] = []
         for ds in self.dataset:
-            archive_name = f"QM9nmr_{ds}_logs.zip"
-            archive_path = os.path.join(data_dir, archive_name)
-            url = DATASET_URLS[ds]
+            archive_path = self._ensure_archive(data_dir, ds)
+            log_files = self._list_log_files(archive_path, limit=self._limit)
+            archive_log_pairs.extend((archive_path, log_file) for log_file in log_files)
 
-            if os.path.isfile(archive_path):
-                try:
-                    with zipfile.ZipFile(archive_path, "r") as zip_ref:
-                        zip_ref.testzip()
-                except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as e:
-                    _LOGGER.warning(
-                        "%s is corrupted or unreadable: %s, removing corrupted archive ...",
-                        archive_name,
-                        e,
-                    )
-                    os.remove(archive_path)
-                    self._download_file(archive_name, url, archive_path)
-                else:
-                    _LOGGER.info("%s already present and valid at %s.", archive_name, archive_path)
-            else:
-                _LOGGER.info("%s not found.", archive_name)
-                self._download_file(archive_name, url, archive_path)
+        if indices is not None:
+            archive_log_pairs = [archive_log_pairs[i] for i in indices]
 
-            structures = self._extract_archive_zip(archive_path, limit=self._limit)
-            self._data.extend(structures)
-
+        self._data = self._extract_log_files(archive_log_pairs)
         self._data_tuple = tuple(self._data)
 
         @lru_cache(maxsize=100000)
@@ -200,7 +196,8 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
     def clear_cache(self):
         self._get_graph_worker.cache_clear()
 
-    def _download_file(self, name: str, url: str, path: str) -> None:
+    @staticmethod
+    def _download_file(name: str, url: str, path: str) -> None:
         _LOGGER.info("\nDownloading %s from %s ...", name, url)
 
         try:
@@ -221,16 +218,65 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         except OSError as e:
             _LOGGER.error("Filesystem error while writing %s: %s", path, e)
 
-    def _extract_archive_zip(self, zip_path: str, limit: int | str | None = None) -> list:
-        structures = []
-        limit_slice = _parse_limit(limit)
+    @classmethod
+    def _ensure_archive(cls, data_dir: str | pathlib.Path, ds: str) -> str:
+        """Return a valid local path to the archive for dataset `ds`, downloading (or
+        re-downloading, if corrupted) it as needed.
 
+        The (potentially expensive) ``testzip`` integrity check is run at most once per
+        archive per process — subsequent calls for an already-validated, still-present
+        file skip it — so repeated instantiations (e.g. ``count`` followed by the actual
+        load, or loading several splits in a row) don't re-scan the whole archive."""
+        archive_name = f"QM9nmr_{ds}_logs.zip"
+        archive_path = os.path.join(data_dir, archive_name)
+        url = DATASET_URLS[ds]
+
+        if archive_path in _VALIDATED_ARCHIVES and os.path.isfile(archive_path):
+            return archive_path
+
+        if os.path.isfile(archive_path):
+            try:
+                with zipfile.ZipFile(archive_path, "r") as zip_ref:
+                    zip_ref.testzip()
+            except (zipfile.BadZipFile, zipfile.LargeZipFile, OSError) as e:
+                _LOGGER.warning(
+                    "%s is corrupted or unreadable: %s, removing corrupted archive ...",
+                    archive_name,
+                    e,
+                )
+                os.remove(archive_path)
+                cls._download_file(archive_name, url, archive_path)
+            else:
+                _LOGGER.info("%s already present and valid at %s.", archive_name, archive_path)
+        else:
+            _LOGGER.info("%s not found.", archive_name)
+            cls._download_file(archive_name, url, archive_path)
+
+        _VALIDATED_ARCHIVES.add(archive_path)
+        return archive_path
+
+    @staticmethod
+    def _list_log_files(zip_path: str, limit: int | str | None = None) -> list[str]:
+        """List the sorted, `limit`-sliced ``.log`` filenames in `zip_path`, without
+        reading or parsing any of them."""
+        limit_slice = _parse_limit(limit)
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             # Sort so that integer-range limits have stable, reproducible semantics.
             log_files = sorted(f for f in zip_ref.namelist() if f.endswith(".log"))
-            log_files = log_files[limit_slice]
+        return log_files[limit_slice]
 
-            for log_file in tqdm.tqdm(log_files, desc="EXTRACT ZIP"):
+    @staticmethod
+    def _extract_log_files(archive_log_pairs: Sequence[tuple[str, str]]) -> list:
+        """Read and parse exactly the given `(archive_path, log_file)` pairs."""
+        structures = []
+        open_zips: dict[str, zipfile.ZipFile] = {}
+        try:
+            for archive_path, log_file in tqdm.tqdm(archive_log_pairs, desc="EXTRACT ZIP"):
+                zip_ref = open_zips.get(archive_path)
+                if zip_ref is None:
+                    zip_ref = zipfile.ZipFile(archive_path, "r")
+                    open_zips[archive_path] = zip_ref
+
                 data = zip_ref.read(log_file)
                 with tempfile.NamedTemporaryFile(
                     mode="w", suffix=".log", encoding="utf-8"
@@ -239,8 +285,28 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
                     # flush before reading back by path, or the log may still be empty
                     tmp_log.flush()
                     structures.append(get_structure_and_data_from_log(pathlib.Path(tmp_log.name)))
+        finally:
+            for zip_ref in open_zips.values():
+                zip_ref.close()
 
         return structures
+
+    @classmethod
+    def count(
+        cls,
+        data_dir: str | pathlib.Path,
+        dataset: str | Sequence[str] = "gasphase",
+        limit: int | str | None = None,
+    ) -> int:
+        """Cheaply count how many structures `(dataset, limit)` selects, without parsing
+        any ``.log`` files. Useful for computing a train/val/test split ahead of loading,
+        so only the wanted split's files need to be extracted (see
+        `Qm9NmrDataModule.load_split`)."""
+        names = [dataset] if isinstance(dataset, str) else list(dataset)
+        return sum(
+            len(cls._list_log_files(cls._ensure_archive(data_dir, ds), limit=limit))
+            for ds in names
+        )
 
 
 # pylint: disable=R1710
@@ -465,6 +531,49 @@ class Qm9NmrDataModule(reax.DataModule):
             self.data_train = train
             self.data_val = val
             self.data_test = test
+
+    def load_split(
+        self,
+        split: str,
+        limit: int | str | None = None,
+        rngs: "nnx.Rngs | None" = None,
+    ) -> "Qm9NmrDataset":
+        """Load only the requested split ("train"/"val"/"test"), extracting just its
+        ``.log`` files.
+
+        Unlike `setup()` — which must extract the full `limit`-restricted archive
+        because training needs all three splits at once — this only parses the files
+        belonging to the requested split. Useful for post-hoc analysis (e.g. recovering
+        exactly which structures were held out at test time for an already-trained run)
+        without paying for the rest of the dataset.
+
+        :param split: which partition to load: "train", "val" or "test".
+        :param limit: like `Qm9NmrDataset`'s own `limit`, but applied to the split's
+            indices instead of the whole dataset — e.g. `limit=20` loads only the
+            first 20 structures of the split, `"10:30"` loads structures 10-29 of it.
+            `None` (default) loads the whole split.
+        :param rngs: must match whatever was used at training time to reproduce the
+            SAME split; defaults to `nnx.Rngs(0)`, REAX's own default when no
+            `Trainer`/`Engine` override is given (true for every config in this repo).
+        """
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"split must be 'train', 'val' or 'test', got {split!r}")
+        if rngs is None:
+            rngs = nnx.Rngs(0)
+
+        n = Qm9NmrDataset.count(self._data_dir, self._dataset, self._limit)
+        splits = reax.data.random_split(rngs, dataset=range(n), lengths=self._train_val_test_split)
+        indices = dict(zip(("train", "val", "test"), splits))[split].indices
+        indices = indices[_parse_limit(limit)]
+
+        return Qm9NmrDataset(
+            r_max=self._rmax,
+            data_dir=self._data_dir,
+            dataset=self._dataset,
+            atom_keys=self._atom_keys,
+            limit=self._limit,
+            indices=indices,
+        )
 
     @override
     def train_dataloader(self) -> reax.DataLoader:
