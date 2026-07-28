@@ -72,8 +72,6 @@ class MagneticShieldingTensor(linen.Module):
     B_ext_at_graph: bool = False  # if True, evaluate Jacobian at graph.globals[B_ext]; else at zero
 
     def setup(self) -> None:
-        # B_ext is always passed explicitly at call time (zeros or graph value).
-        # This avoids hardcoding shape in at=, which would break for varying batch sizes.
         self._diff_fn = gcnn.diff(
             self.B_ind_fn,
             f"nodes.{self.B_ind}:Iγ",
@@ -84,7 +82,13 @@ class MagneticShieldingTensor(linen.Module):
         )
 
     def __call__(self, graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-        B_ext_val = graph.globals[self.B_ext] if self.B_ext_at_graph else jnp.zeros_like(graph.globals[self.B_ext])
+        # B_ext is always passed explicitly at call time (zeros or graph value) adding the dimension corrisonding to the number of graphs in batch.
+        if self.B_ext_at_graph:
+            B_ext_val = graph.globals[self.B_ext]
+        else:
+            n_graphs = graph.n_node.shape[0]
+            B_ext_val = jnp.zeros((n_graphs, 3))
+
         shielding, graph = self._diff_fn(graph, B_ext_val)
         
         graph = (

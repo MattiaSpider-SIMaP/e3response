@@ -73,10 +73,17 @@ target/
 
 examples/*/
 
+configs/*/
+
 outputs/*
 local/*
 data/*
 notebooks/*
+nmr_sensitivity/*
+structure_resolution/qm9_nmr/results_non_grad_alg/*
+structure_resolution/qm9_nmr/results/*
+
+NOTES.md
 
 logs/*
 

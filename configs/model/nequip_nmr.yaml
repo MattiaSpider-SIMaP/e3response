@@ -97,7 +97,7 @@ model:
 
     # Per atom NMR tensors
     - _target_: tensorial.gcnn.NodewiseLinear
-      irreps_out: 1x0e + 1x1o + 1x2e
+      irreps_out: 1x0e + 1x1e + 1x2e
       out_field: predicted_nmr_tensors
 
     - _target_: tensorial.gcnn.NodewiseDecoding
@@ -106,5 +106,5 @@ model:
         predicted_nmr_tensors:
           _target_: tensorial.CartesianTensor
           formula: ij
-          i: 1o
-          j: 1o
+          i: 1e
+          j: 1e
