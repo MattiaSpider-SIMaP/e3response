@@ -144,7 +144,7 @@ class CshNmrDataModule(reax.DataModule):
             dataset in `_load_structures` before splitting.
         :param rngs: must match whatever was used at training time to reproduce the
             SAME split; defaults to `nnx.Rngs(0)`, REAX's own default when no
-            `Trainer`/`Engine` override is given (true for every config in this repo).
+            `Trainer`/`Engine` override is given.
         """
         if split not in ("train", "val", "test"):
             raise ValueError(f"split must be 'train', 'val' or 'test', got {split!r}")
@@ -184,8 +184,6 @@ class CshNmrDataModule(reax.DataModule):
         atoms.arrays["mask"] = np.asarray(entry["mask"], dtype=bool)
         atoms.info["struct_type"] = entry.get("struct_type")
         atoms.info["ca_si_ratio"] = entry.get("ca_si_ratio")
-        # Store energy and external field under the canonical keys so they can be exposed
-        # as globals (mirrors qm9_nmr.py); ``energy`` is what EnergyContributionLstsq reads.
         atoms.arrays[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
         atoms.arrays[gcnn.atomic.TOTAL_ENERGY] = np.asarray(entry.get("energy_Ry"))
         return atoms

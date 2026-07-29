@@ -1,9 +1,4 @@
-"""Shared helper for parsing dataset ``limit`` specifications.
-
-Several NMR datamodules accept a ``limit`` that restricts how much data is loaded (either
-the whole dataset or a single split). They all share the same slice-parsing semantics,
-factored out here so there is a single definition (see `parse_limit`).
-"""
+"""Shared helper for parsing dataset ``limit`` specifications."""
 
 
 def parse_limit(limit: int | str | None) -> slice:

@@ -123,7 +123,7 @@ class SiNmrDataModule(reax.DataModule):
             semantics. `None` (default) returns the whole split.
         :param rngs: must match whatever was used at training time to reproduce the
             SAME split; defaults to `nnx.Rngs(0)`, REAX's own default when no
-            `Trainer`/`Engine` override is given (true for every config in this repo).
+            `Trainer`/`Engine` override is given.
         """
         if split not in ("train", "val", "test"):
             raise ValueError(f"split must be 'train', 'val' or 'test', got {split!r}")

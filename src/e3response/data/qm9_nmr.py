@@ -205,6 +205,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
         archive per process — subsequent calls for an already-validated, still-present
         file skip it — so repeated instantiations (e.g. ``count`` followed by the actual
         load, or loading several splits in a row) don't re-scan the whole archive."""
+
         archive_name = f"QM9nmr_{ds}_logs.zip"
         archive_path = os.path.join(data_dir, archive_name)
         url = DATASET_URLS[ds]
@@ -532,7 +533,7 @@ class Qm9NmrDataModule(reax.DataModule):
             `None` (default) loads the whole split.
         :param rngs: must match whatever was used at training time to reproduce the
             SAME split; defaults to `nnx.Rngs(0)`, REAX's own default when no
-            `Trainer`/`Engine` override is given (true for every config in this repo).
+            `Trainer`/`Engine` override is given.
         """
         if split not in ("train", "val", "test"):
             raise ValueError(f"split must be 'train', 'val' or 'test', got {split!r}")
