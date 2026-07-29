@@ -14,33 +14,11 @@ from tensorial import gcnn
 from typing_extensions import override
 
 from e3response import keys
+from e3response.data._limit import parse_limit
 
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = ("CshNmrDataModule",)
-
-
-def _parse_limit(limit: int | str | None) -> slice:
-    """Convert a limit spec to a slice over a split's structure list.
-
-    - None       → slice(None)       (all structures)
-    - int N      → slice(None, N)    (first N structures)
-    - "a:b"      → slice(a, b)       (structures a through b-1)
-    - "a:b:s"    → slice(a, b, s)    (with step)
-    """
-    if limit is None:
-        return slice(None)
-    if isinstance(limit, int):
-        return slice(None, limit)
-    parts = limit.split(":")
-    indices = [int(p) if p else None for p in parts]
-    if len(indices) == 2:
-        return slice(indices[0], indices[1])
-    if len(indices) == 3:
-        return slice(indices[0], indices[1], indices[2])
-    raise ValueError(
-        f"Cannot parse limit {limit!r}: expected int, 'start:stop', or 'start:stop:step'"
-    )
 
 
 def _apply_limit(structures: list[Atoms], limit: int | str | None) -> list[Atoms]:
@@ -59,7 +37,7 @@ def _apply_limit(structures: list[Atoms], limit: int | str | None) -> list[Atoms
             return [s for s in structures if s.info.get("struct_type") == "bulk"]
         if limit_lower == "only surface":
             return [s for s in structures if s.info.get("struct_type") == "surf"]
-    return structures[_parse_limit(limit)]
+    return structures[parse_limit(limit)]
 
 
 class CshNmrDataModule(reax.DataModule):

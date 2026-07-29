@@ -26,6 +26,7 @@ import tqdm
 from typing_extensions import override
 
 from e3response import keys
+from e3response.data._limit import parse_limit
 
 __all__ = ("Qm9NmrDataset", "Qm9NmrDataModule")
 
@@ -54,29 +55,6 @@ mu_dict = {
     "O": -1.893543,  # 17O
     "F": 2.628321,  # 19F
 }
-
-
-def _parse_limit(limit: int | str | None) -> slice:
-    """Convert a limit spec to a slice over a sorted file list.
-
-    - None       → slice(None)       (all files)
-    - int N      → slice(None, N)    (first N files)
-    - "a:b"      → slice(a, b)       (files a through b-1)
-    - "a:b:s"    → slice(a, b, s)    (with step)
-    """
-    if limit is None:
-        return slice(None)
-    if isinstance(limit, int):
-        return slice(None, limit)
-    parts = limit.split(":")
-    indices = [int(p) if p else None for p in parts]
-    if len(indices) == 2:
-        return slice(indices[0], indices[1])
-    if len(indices) == 3:
-        return slice(indices[0], indices[1], indices[2])
-    raise ValueError(
-        f"Cannot parse limit {limit!r}: expected int, 'start:stop', or 'start:stop:step'"
-    )
 
 
 class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
@@ -259,7 +237,7 @@ class Qm9NmrDataset(collections.abc.Sequence[jraph.GraphsTuple]):
     def _list_log_files(zip_path: str, limit: int | str | None = None) -> list[str]:
         """List the sorted, `limit`-sliced ``.log`` filenames in `zip_path`, without
         reading or parsing any of them."""
-        limit_slice = _parse_limit(limit)
+        limit_slice = parse_limit(limit)
         with zipfile.ZipFile(zip_path, "r") as zip_ref:
             # Sort so that integer-range limits have stable, reproducible semantics.
             log_files = sorted(f for f in zip_ref.namelist() if f.endswith(".log"))
@@ -564,7 +542,7 @@ class Qm9NmrDataModule(reax.DataModule):
         n = Qm9NmrDataset.count(self._data_dir, self._dataset, self._limit)
         splits = reax.data.random_split(rngs, dataset=range(n), lengths=self._train_val_test_split)
         indices = dict(zip(("train", "val", "test"), splits))[split].indices
-        indices = indices[_parse_limit(limit)]
+        indices = indices[parse_limit(limit)]
 
         return Qm9NmrDataset(
             r_max=self._rmax,

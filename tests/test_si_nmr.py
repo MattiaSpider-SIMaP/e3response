@@ -1,7 +1,10 @@
 import collections
+import json
 
 import ase
+from monty.json import MontyEncoder
 import numpy as np
+from pymatgen.core import Lattice, Structure
 import pytest
 import reax
 
@@ -54,6 +57,44 @@ def _make_dm(split=(0.5, 0.25, 0.25)) -> SiNmrDataModule:
         train_val_test_split=split,
         batch_size=1,
     )
+
+
+@pytest.fixture
+def mock_si_json(tmp_path):
+    """A real (Monty-encoded) si_data.json with 8 minimal entries, so the actual
+    `_load_structures` (and its `parse_limit` slicing) can be exercised end-to-end."""
+    n_entries = 8
+    entries = []
+    for seed in range(n_entries):
+        rng = np.random.default_rng(seed)
+        structure = Structure(
+            Lattice.cubic(5.0), ["Si", "O", "O", "O"], rng.random((4, 3))
+        )
+        entries.append(
+            {
+                "structure": structure,
+                "ind": [0],
+                "N": 4,
+                "tensor": rng.random((1, 3, 3)).tolist(),
+                "Qn": [3],
+            }
+        )
+    json_path = tmp_path / "si_data.json"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, cls=MontyEncoder)
+    return json_path, n_entries
+
+
+@pytest.mark.parametrize(
+    "limit, expected",
+    [(None, 8), (3, 3), ("0:6", 6), ("2:8:2", 3)],
+)
+def test_si_nmr_constructor_limit(mock_si_json, limit, expected):
+    """The constructor `limit` (int or slice-string) is applied via the shared
+    parse_limit inside `_load_structures`."""
+    json_path, _ = mock_si_json
+    dm = SiNmrDataModule(r_max=3.0, data_file=json_path, batch_size=1, limit=limit)
+    assert len(dm._load_structures()) == expected
 
 
 def test_si_nmr_qn_grouping(mock_structures):

@@ -116,6 +116,23 @@ def test_csh_nmr_datamodule_only_surface(mock_csh_json, test_engine):
     )
 
 
+@pytest.mark.parametrize(
+    "limit, expected",
+    [(None, _MOCK_N_STRUCTURES), (6, 6), ("0:6", 6), ("2:8:2", 3)],
+)
+def test_csh_nmr_constructor_slice_string_limit(mock_csh_json, limit, expected):
+    """A slice-string / int limit is routed through the shared parse_limit inside
+    _apply_limit in the constructor (distinct from the 'only bulk'/'only surface' path)."""
+    dm = CshNmrDataModule(
+        r_max=3.0,
+        data_file=mock_csh_json,
+        train_val_test_split=(0.6, 0.2, 0.2),
+        batch_size=1,
+        limit=limit,
+    )
+    assert len(dm._load_structures()) == expected
+
+
 def test_csh_nmr_dataloaders(mock_csh_json, test_engine):
     """All three dataloaders yield valid graph batches with the expected fields."""
     dm = CshNmrDataModule(

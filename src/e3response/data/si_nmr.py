@@ -16,33 +16,11 @@ from tensorial import gcnn
 from typing_extensions import override
 
 from e3response import keys
+from e3response.data._limit import parse_limit
 
 _LOGGER = logging.getLogger(__name__)
 
 __all__ = ("SiNmrDataModule",)
-
-
-def _parse_limit(limit: int | str | None) -> slice:
-    """Convert a limit spec to a slice over a split's structure list.
-
-    - None       → slice(None)       (all structures)
-    - int N      → slice(None, N)    (first N structures)
-    - "a:b"      → slice(a, b)       (structures a through b-1)
-    - "a:b:s"    → slice(a, b, s)    (with step)
-    """
-    if limit is None:
-        return slice(None)
-    if isinstance(limit, int):
-        return slice(None, limit)
-    parts = limit.split(":")
-    indices = [int(p) if p else None for p in parts]
-    if len(indices) == 2:
-        return slice(indices[0], indices[1])
-    if len(indices) == 3:
-        return slice(indices[0], indices[1], indices[2])
-    raise ValueError(
-        f"Cannot parse limit {limit!r}: expected int, 'start:stop', or 'start:stop:step'"
-    )
 
 
 class SiNmrDataModule(reax.DataModule):
@@ -56,7 +34,7 @@ class SiNmrDataModule(reax.DataModule):
         data_file: Union[str, pathlib.Path] = "data/si_nmr/si_data.json",
         train_val_test_split: Sequence[Union[int, float]] = (0.8, 0.1, 0.1),
         batch_size: int = 64,
-        limit: Optional[int] = None,
+        limit: Optional[Union[int, str]] = None,
     ) -> None:
         super().__init__()
 
@@ -155,7 +133,7 @@ class SiNmrDataModule(reax.DataModule):
         structures = self._load_structures()
         train, val, test = self._grouped_split(structures, rngs)
         split_structures = dict(zip(("train", "val", "test"), (train, val, test)))[split]
-        split_structures = split_structures[_parse_limit(limit)]
+        split_structures = split_structures[parse_limit(limit)]
 
         return list(map(self._to_graph, split_structures))
 
@@ -185,8 +163,7 @@ class SiNmrDataModule(reax.DataModule):
 
             structures.append(atoms)
 
-        if self._limit is not None:
-            structures = structures[: self._limit]
+        structures = structures[parse_limit(self._limit)]
 
         _LOGGER.info("Number of loaded structures: %d", len(structures))
         return structures
