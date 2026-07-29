@@ -1,4 +1,5 @@
 import collections
+import functools
 import json
 import logging
 import pathlib
@@ -42,6 +43,25 @@ def _parse_limit(limit: int | str | None) -> slice:
     )
 
 
+def _apply_limit(structures: list[Atoms], limit: int | str | None) -> list[Atoms]:
+    """Restrict a structure list according to `limit`. Shared by the constructor
+    `limit` (applied to the full dataset in `_load_structures`) and `load_split`'s
+    own `limit` (applied to a single split) so both behave identically:
+
+    - None                        → all structures
+    - "only bulk"/"only surface"  → keep only that ``struct_type``
+    - int N                       → first N structures
+    - "a:b"/"a:b:s"               → Python-slice semantics
+    """
+    if isinstance(limit, str):
+        limit_lower = limit.lower()
+        if limit_lower == "only bulk":
+            return [s for s in structures if s.info.get("struct_type") == "bulk"]
+        if limit_lower == "only surface":
+            return [s for s in structures if s.info.get("struct_type") == "surf"]
+    return structures[_parse_limit(limit)]
+
+
 class CshNmrDataModule(reax.DataModule):
     """Calcium Silicate Hydrate dataset from a pre-processed JSON file containing ASE atoms objects with NMR tensor data."""
 
@@ -82,8 +102,8 @@ class CshNmrDataModule(reax.DataModule):
         val_graphs = list(map(self._to_graph, val))
         test_graphs = list(map(self._to_graph, test))
 
-        calc_padding = lambda graphs: gcnn.data.GraphBatcher.calculate_padding(
-            graphs, batch_size=self._batch_size, with_shuffle=True
+        calc_padding = functools.partial(
+            gcnn.data.GraphBatcher.calculate_padding, batch_size=self._batch_size, with_shuffle=True
         )
 
         self._max_padding = gcnn.data.max_padding(
@@ -97,9 +117,12 @@ class CshNmrDataModule(reax.DataModule):
     def _grouped_split(
         self, structures: list[Atoms], rngs: "nnx.Rngs"
     ) -> tuple[list[Atoms], list[Atoms], list[Atoms]]:
-        """Stratified train/val/test split: groups structures by struct_type
+        """Stratified train/val/test split: groups structures by their struct_type
         ("bulk"/"surf") and splits each group independently so every partition
-        contains the same ratio of each type."""
+        contains the same ratio of each type.
+
+        (This is the csh-specific stratification key — si_nmr instead groups by the
+        atoms' Qn signature; the method shape is deliberately kept parallel.)"""
         groups: dict[str, list[Atoms]] = collections.defaultdict(list)
         for atoms in structures:
             groups[atoms.info.get("struct_type")].append(atoms)
@@ -119,7 +142,7 @@ class CshNmrDataModule(reax.DataModule):
             atoms,
             r_max=self._rmax,
             atom_include_keys=("numbers", "nmr_tensors", "mask"),
-            global_include_keys=[],
+            global_include_keys=[keys.EXTERNAL_MAGNETIC_FIELD, gcnn.atomic.TOTAL_ENERGY],
         )
 
     def load_split(
@@ -135,9 +158,12 @@ class CshNmrDataModule(reax.DataModule):
         held out at test time for an already-trained run).
 
         :param split: which partition to load: "train", "val" or "test".
-        :param limit: further restricts the returned split - int N takes the first N
-            structures of the split, "start:stop"/"start:stop:step" applies Python-slice
-            semantics. `None` (default) returns the whole split.
+        :param limit: further restricts the returned split, with the SAME semantics as
+            the constructor ``limit`` (see `_apply_limit`): "only bulk"/"only surface"
+            filter by ``struct_type``, int N takes the first N, "start:stop"/"start:stop:step"
+            apply Python-slice semantics. `None` (default) returns the whole split. It is
+            applied on top of the constructor ``limit``, which already restricted the full
+            dataset in `_load_structures` before splitting.
         :param rngs: must match whatever was used at training time to reproduce the
             SAME split; defaults to `nnx.Rngs(0)`, REAX's own default when no
             `Trainer`/`Engine` override is given (true for every config in this repo).
@@ -150,7 +176,7 @@ class CshNmrDataModule(reax.DataModule):
         structures = self._load_structures()
         train, val, test = self._grouped_split(structures, rngs)
         split_structures = dict(zip(("train", "val", "test"), (train, val, test)))[split]
-        split_structures = split_structures[_parse_limit(limit)]
+        split_structures = _apply_limit(split_structures, limit)
 
         return list(map(self._to_graph, split_structures))
 
@@ -162,17 +188,7 @@ class CshNmrDataModule(reax.DataModule):
             entries = json.load(file)
 
         structures = [self._entry_to_atoms(entry) for entry in entries]
-
-        if isinstance(self._limit, str):
-            limit_lower = self._limit.lower()
-            if limit_lower == "only bulk":
-                structures = [s for s in structures if s.info.get("struct_type") == "bulk"]
-            elif limit_lower == "only surface":
-                structures = [s for s in structures if s.info.get("struct_type") == "surf"]
-            else:
-                raise ValueError(f"Unknown limit option: {self._limit}")
-        elif self._limit is not None:
-            structures = structures[: self._limit]
+        structures = _apply_limit(structures, self._limit)
 
         _LOGGER.info("Number of loaded structures: %d", len(structures))
 
@@ -190,7 +206,10 @@ class CshNmrDataModule(reax.DataModule):
         atoms.arrays["mask"] = np.asarray(entry["mask"], dtype=bool)
         atoms.info["struct_type"] = entry.get("struct_type")
         atoms.info["ca_si_ratio"] = entry.get("ca_si_ratio")
-        atoms.info["energy_Ry"] = entry.get("energy_Ry")
+        # Store energy and external field under the canonical keys so they can be exposed
+        # as globals (mirrors qm9_nmr.py); ``energy`` is what EnergyContributionLstsq reads.
+        atoms.arrays[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
+        atoms.arrays[gcnn.atomic.TOTAL_ENERGY] = np.asarray(entry.get("energy_Ry"))
         return atoms
 
     @override
