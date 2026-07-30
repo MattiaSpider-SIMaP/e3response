@@ -35,6 +35,7 @@ class SiNmrDataModule(reax.DataModule):
         train_val_test_split: Sequence[Union[int, float]] = (0.8, 0.1, 0.1),
         batch_size: int = 64,
         limit: Optional[Union[int, str]] = None,
+        stratify: bool = True,
     ) -> None:
         super().__init__()
 
@@ -44,6 +45,7 @@ class SiNmrDataModule(reax.DataModule):
         self._train_val_test_split: Final[Sequence[Union[int, float]]] = train_val_test_split
         self._batch_size: Final[int] = batch_size
         self._limit = limit
+        self._stratify: Final[bool] = stratify
 
         # State
         self.batch_size_per_device = batch_size
@@ -57,7 +59,7 @@ class SiNmrDataModule(reax.DataModule):
             return
 
         structures = self._load_structures()
-        train, val, test = self._grouped_split(structures, stage.rngs)
+        train, val, test = self._split(structures, stage.rngs)
 
         train_graphs = list(map(self._to_graph, train))
         val_graphs = list(map(self._to_graph, val))
@@ -74,6 +76,18 @@ class SiNmrDataModule(reax.DataModule):
         self.data_train = train_graphs
         self.data_val = val_graphs
         self.data_test = test_graphs
+
+    def _split(
+        self, structures: list[Atoms], rngs: "nnx.Rngs"
+    ) -> tuple[list[Atoms], list[Atoms], list[Atoms]]:
+        """Split into train/val/test. Stratified by Qn signature when ``stratify`` is set
+        (default, see `_grouped_split`), otherwise a plain random split over all structures."""
+        if self._stratify:
+            return self._grouped_split(structures, rngs)
+        train, val, test = reax.data.random_split(
+            rngs, dataset=structures, lengths=self._train_val_test_split
+        )
+        return list(train), list(val), list(test)
 
     def _grouped_split(
         self, structures: list[Atoms], rngs: "nnx.Rngs"
@@ -131,7 +145,7 @@ class SiNmrDataModule(reax.DataModule):
             rngs = nnx.Rngs(0)
 
         structures = self._load_structures()
-        train, val, test = self._grouped_split(structures, rngs)
+        train, val, test = self._split(structures, rngs)
         split_structures = dict(zip(("train", "val", "test"), (train, val, test)))[split]
         split_structures = split_structures[parse_limit(limit)]
 

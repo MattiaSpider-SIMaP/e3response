@@ -110,6 +110,25 @@ def test_si_nmr_qn_grouping(mock_structures):
         assert len(groups[(q,)]) == _MOCK_PER_CLASS, f"Wrong size for Q{q} group"
 
 
+def test_si_nmr_non_stratified_split(mock_structures, test_engine, monkeypatch):
+    """stratify=False falls back to a plain random split over all structures (no Qn grouping):
+    partitions still cover the whole dataset and are non-empty for this well-sized mock."""
+    monkeypatch.setattr(SiNmrDataModule, "_load_structures", lambda self: mock_structures)
+
+    dm = SiNmrDataModule(
+        r_max=3.0,
+        data_file="dummy.json",
+        train_val_test_split=(0.5, 0.25, 0.25),
+        batch_size=1,
+        stratify=False,
+    )
+    dm.setup(_DummyStage(test_engine))
+
+    n_train, n_val, n_test = len(dm.data_train), len(dm.data_val), len(dm.data_test)
+    assert n_train + n_val + n_test == _MOCK_N_STRUCTURES
+    assert n_train > 0 and n_val > 0 and n_test > 0
+
+
 def test_si_nmr_datamodule_stratified(mock_structures, test_engine, monkeypatch):
     """Stratified split: every partition contains structures from all Q classes."""
     monkeypatch.setattr(SiNmrDataModule, "_load_structures", lambda self: mock_structures)
