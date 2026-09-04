@@ -51,7 +51,7 @@ logging.getLogger("absl").setLevel(logging.ERROR)
 # ── CONFIGURATION ──────────────────────────────────────────────────────────────
 
 # Model checkpoint directory (must contain config.yaml and checkpoints/last.ckpt).
-RUN_DIR = "/home/mattia/Desktop/ml_codes/nmr_diff_project/qm9_full_heavy/nequip_nmr"
+RUN_DIR = "/home/mattia/Desktop/ml_codes/nmr_project/nmr_diff_runs/qm9_full_heavy/nequip_nmr"
 
 # Dataset — DATASET/R_MAX/train_val_test_split come from RUN_DIR/config.yaml (cfg.data
 # below), so the reproduced split matches the run. Only data_dir is overridden, since the
@@ -112,7 +112,7 @@ RESTART_LOSS_TOL = 5.0   # ppm: a run below this is "good enough" → stop resta
 RESTART_JITTER   = 0.4   # Å: σ of the Gaussian jitter that seeds each restart's start pos.
 
 # Step 6 – statistics loop
-RUN_STATS      = True  # set False to skip the multi-molecule statistics loop
+RUN_STATS      = False  # set False to skip the multi-molecule statistics loop
 N_MOL_STAT     = 100     # how many molecules to include (ignored if RUN_STATS=False)
 N_ATOM_STAT    = 1      # atoms per molecule
 DIST_THRESHOLD = 0.2    # Å – "success" criterion
