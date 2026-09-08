@@ -38,7 +38,7 @@ Steps:
   1. Ground-truth spectra (from DFT labels or from the model at the true geometry).
   2. Gaussian perturbation of atom k with validity checks (minimum image).
   3. Loss = spectral mismatch, averaged over the fitted nuclei.
-  4. Gradient-based local minimisation (gcnn.adapt + jax.scipy.optimize BFGS, 3 DOF).
+  4. Adam multistart with a live neighbour list (structure_search, 3 DOF).
   5. Evaluation: |Δr|, loss curve, overlaid spectra; per-run GIF.
   6. (Optional) Statistics over many structures.
 """
@@ -69,7 +69,7 @@ import scipy.optimize
 from tensorial import gcnn
 from tensorial.gcnn import atomic
 
-from e3response import keys, nmr_spectra
+from e3response import keys, nmr_spectra, structure_search as ss
 
 logging.getLogger("reax").setLevel(logging.ERROR)
 logging.getLogger("jax").setLevel(logging.ERROR)
@@ -133,41 +133,46 @@ REF_SLOPE     = -1.0
 REF_INTERCEPT = 0.0
 # The grid must hold the peaks for the WHOLE optimiser excursion: if a line leaves the
 # window its area vanishes, normalisation blows up, and both loss and gradient become
-# artefacts rather than signal. Na moves ~95 ppm/Å here, so keep this generous — and
-# note that MAX_DISPLACEMENT=None (no bound) lets BFGS travel arbitrarily far.
+# artefacts rather than signal. Na moves ~95 ppm/Å here, so keep this generous — a start
+# roams at most LOCAL_CAP (Å) from itself and START_RADIUS from the guess.
 GRID_MARGIN = 150.0        # ppm of padding beyond the target's own peak range
 GRID_POINTS = 1024
 
-# Optimisation:
-# gcnn.adapt + jax.scipy.optimize.minimize (BFGS). The NMR-tensor loss is
-# differentiable end-to-end (the model recomputes edge vectors from positions),
-# so jopt minimises it fully on device with exact autodiff gradients. 
+# Optimisation — the shared `structure_search` Adam multistart (see module docstring).
+# `N_STARTS` starts are drawn in a ball around the perturbed position and descended in
+# parallel by a vmapped Adam; each stays within `LOCAL_CAP` of its own start, so coverage
+# comes from the spread of the starts. The neighbour list is rebuilt every step, so the
+# periodic topology follows the atom as it moves. Replaces the old jax.scipy BFGS, whose
+# strong-Wolfe line search never converged on the float32-noisy loss (status=3, 10/10).
+METHOD_LABEL = "structure_search-Adam"
+PRINT_EVALS  = True    # print the 10 best starts' loss + |Δr| after the run (not per step).
 
-METHOD_LABEL = "jopt-BFGS"
-MAX_ITER     = 1000
-GRAD_CHECK   = False   # finite-difference-verify the JAX gradient
-PRINT_EVALS  = True    # print loss + |Δpos| at every optimiser evaluation (incl. line-search
-                       # probes, via jax.debug.print so it works inside the on-device loop).
-                       # Noisy for multi-molecule STEP 6 stats — turn off there if needed.
-# Smoothly cap atom k's displacement from its start: the optimised variable u is mapped
-# to pos_k = x0 + R·tanh((u − x0)/R), so |pos_k − x0| < R (Å) for ANY u. Keeps BFGS from
-# firing the atom into far, degenerate geometries (inf/nan loss, spurious flat minima far
-# away) — the failure mode seen with larger SIGMA. Must exceed the true displacement to be
-# recovered (so comfortably above SIGMA's tail, ~2–3× SIGMA). None → no bound (raw BFGS).
-MAX_DISPLACEMENT = None
+N_STARTS         = 64    # parallel Adam descents per atom (multistart width)
+START_RADIUS     = 2.5   # Å: radius of the ball of starts around the perturbed position
+STARTS_PER_BATCH = 4     # vmap lanes at once (reverse-mode AD through the 71-atom periodic
+                         # model is ~0.6 GB/lane; 8 lanes OOMs at ~4.7 GB)
+ADAM_STEPS       = 500    # Adam iterations per start
+ADAM_LR0         = 0.08   # initial Å-scale step (cosine-decayed to ADAM_LR1)
+ADAM_LR1         = 0.004  # final step: the resolution the answer is polished to
+LOCAL_CAP        = 1.5    # each start relaxes within this Å of itself (smooth tanh cap)
 
-# Multistart: BFGS often lands in a wrong, high-loss basin (the atom drifts to a spurious
-# local min instead of the true position). Since we can only OBSERVE the loss (no ground
-# truth), we retry from jittered starts and keep the run with the LOWEST final loss.
-N_RESTARTS       = 5     # max BFGS runs per atom (0 or 1 = restarts off, a single run).
-                         # Extra runs only fire when the current best is still above
-                         # RESTART_LOSS_TOL.
-RESTART_LOSS_TOL = 2.0   # a run below this is "good enough" → stop restarting. Also the
-                         # loss ceiling for a recovery to count as "reliable" in STEP 6.
-                         # UNITS FOLLOW `METRIC`: ppm of transport for "wasserstein",
-                         # dimensionless for "rmse"/"cosine" — retune when you switch.
-                         # Anchor it on the loss at the true geometry, printed by STEP 3.
-RESTART_JITTER   = 0.4   # Å: σ of the Gaussian jitter that seeds each restart's start pos.
+# Clash guard: a smooth repulsion keeps atom k out of the model's blow-up zone.
+MIN_DIST_GUARD   = 0.5   # Å below which the model blows up; fenced off by the penalty
+GUARD_MARGIN     = 0.15  # Å above the guard where the penalty switches on
+GUARD_WEIGHT     = 200.0 # penalty = weight · (guard + margin − d)²
+
+# Live neighbour list: rebuild the graph's neighbours at every Adam step so the periodic
+# topology stays correct as the atom moves (a frozen list goes stale — module docstring).
+LIVE_NEIGHBOURS   = True
+NEIGHBOUR_CAPACITY = None  # slots per atom, or None to estimate + verify against the geometry
+
+# Observable degeneracy check (no ground truth): distinct minima whose loss rivals the best.
+DEGENERACY_SEP   = 0.5   # Å — how far apart two minima must be to count as distinct
+DEGENERACY_TOL   = 0.25  # relative loss gap below which a rival minimum is "as good"
+
+# A recovery counts as "reliable" in STEP 6 when its final loss is below this — an
+# observable-only proxy. UNITS FOLLOW `METRIC` (ppm of transport for "wasserstein").
+RELIABLE_LOSS_TOL = 2.0
 
 # Step 6 – statistics loop
 RUN_STATS      = True  # set False to skip the multi-molecule statistics loop
@@ -758,295 +763,141 @@ print(f"  perturbed pos: {pos_pert}")
 
 print(f"\n[STEP 3] Building loss function …")
 
-# ── The supervisor's on-device minimiser (reproduced 1:1, for reference) ───────
-# `gcnn.adapt(fun, wrt, outs=(what,))` wraps a graph function so it takes the
-# optimised quantity as a positional arg (injected at `wrt`) and returns the
-# scalar at `what`; `jax.scipy.optimize.minimize` then minimises it entirely on
-# device. It is fast and gradient-based, but exposes no per-iteration trajectory,
-# so the visualised runs below drive the SAME differentiable loss with scipy
-# instead (see `minimize_atom`). Kept here as the canonical idiom for CSH scaling.
-from collections.abc import Callable          # noqa: E402
-from jax.scipy import optimize as jopt        # noqa: E402
-import tensorial                              # noqa: E402
+# ── Spectrum trajectory for the GIF, and the Adam multistart optimiser ─────────
+# The optimiser itself is the shared `structure_search` engine (Adam multistart + live
+# neighbour list); the ONLY experiment-specific piece is `loss_fn(pred) -> scalar` = the
+# mean spectral mismatch. It replaces the old jax.scipy BFGS, whose strong-Wolfe line
+# search never converged on the float32-noisy loss (status=3 in 10/10 benchmark cases).
 
+def trajectory_spectra(module, params, atom_k, specs, atoms_base, positions,
+                       rebuild=None, chunk=16):
+    """Predicted spectrum of the first fitted nucleus at each of `positions`.
 
-def minimize_fn(fun, what, wrt) -> Callable:
-    graph_fn = gcnn.adapt(fun, wrt, outs=(what,))
-
-    def minim(graph, x0, *, method, tol=None, options=None):
-        # optimize() only takes 1D arrays, so flatten and un-flatten
-        def to_minimize(value):
-            value = value.reshape(x0.shape)
-            return tensorial.as_array(graph_fn(graph, value)).flatten()[0]
-
-        res = jopt.minimize(to_minimize, x0.flatten(), method=method, tol=tol, options=options)
-        res = res._replace(x=res.x.reshape(x0.shape))
-        return res
-
-    return minim
-
-
-# ── Differentiable NMR loss + gradient (the actual, observable optimiser) ──────
-
-def _bound_disp(u, x0, max_disp, xp):
-    """Map the unconstrained optimiser variable `u` to a position whose displacement
-    from `x0` is smoothly capped at `max_disp`.
-
-    Radial (isotropic) tanh squashing: with ``d = u − x0`` and ``r = |d|``, returns
-    ``x0 + d · (R·tanh(r/R) / r)``, so the Euclidean displacement is
-    ``|pos − x0| = R·tanh(r/R) < R`` for any `u`, and small steps (r ≪ R) are left
-    essentially unchanged. Smooth everywhere (the +eps keeps r away from 0). `xp` is
-    the array module (``jnp`` inside the traced loss, ``np`` on the host).
-    ``max_disp=None`` → identity (raw, unbounded)."""
-    if max_disp is None:
-        return u
-    d = u - x0
-    r = xp.sqrt(xp.sum(d * d) + 1e-12)
-    return x0 + d * (max_disp * xp.tanh(r / max_disp) / r)
-
-
-def make_value_and_grad(module, params, atom_k, specs, x0=None, max_disp=None):
-    """Build a JAX (loss, grad) function of atom k's optimiser variable.
-
-    Given a graph (fixed topology) and the optimiser variable, it maps it to a
-    (optionally displacement-bounded) position, injects it into the positions and
-    runs the model — whose ``EdgeVectors`` layer RECOMPUTES the edge vectors from the
-    positions, so reverse-mode autodiff flows all the way back. The tensors are then
-    turned into spectra and compared with the targets, so the gradient chain is
-    ``pos_k → tensors → spectra → loss`` and is exact for that topology. The predicted
-    spectrum of the first fitted nucleus is carried as aux (for the GIF).
-    """
+    The vmapped Adam no longer records spectra as it goes — with `N_STARTS` runs in flight
+    that would be an (N_STARTS, ADAM_STEPS, GRID_POINTS) array — so the GIF's curves are
+    recomputed afterwards, for the winning trajectory only. Batched in chunks of `chunk`
+    (a ragged tail is padded up rather than triggering a second compilation)."""
     n_atoms = specs[0].weights.shape[0]
-    x0j = None if x0 is None else jnp.asarray(x0)
+    graph_base = to_graph(atoms_base)
+    pos_all = jnp.asarray(atoms_base.positions, dtype=jnp.float32)
 
-    def _loss(graph, u):
-        pos_k = _bound_disp(u, x0j, max_disp, jnp)
-        pos  = graph.nodes["positions"].at[atom_k].set(pos_k)
-        g    = gcnn.experimental.update_graph(graph).set(("nodes", "positions"), pos).get()
-        out  = module._model.apply(params, g)
-        pred = out.nodes["predicted_nmr_tensors"][:n_atoms]
-        return spectral_loss(pred, specs), species_spectrum(pred, specs[0])
+    @jax.jit
+    @jax.vmap
+    def _spec(pos_k):
+        pos = pos_all.at[atom_k].set(pos_k)
+        g = gcnn.experimental.update_graph(graph_base).set(("nodes", "positions"), pos).get()
+        if rebuild is not None:
+            g = rebuild(g, pos)
+        out = module._model.apply(params, g)
+        return species_spectrum(out.nodes["predicted_nmr_tensors"][:n_atoms], specs[0])
 
-    return jax.jit(jax.value_and_grad(_loss, argnums=1, has_aux=True))
-
-
-def make_loss_graph_fn(module, params, atom_k, specs,
-                       recorder=None, x0=None, max_disp=None):
-    """GraphFunction for the supervisor's ``minimize_fn``.
-
-    It reads the optimiser variable from the custom field ``globals.pos_k`` (injected
-    by ``gcnn.adapt``), maps it to a (optionally displacement-bounded) position, writes
-    it into ``nodes.positions``, runs the model — whose ``EdgeVectors`` layer recomputes
-    edge vectors from positions — synthesises one spectrum per fitted nucleus and
-    stores their mean mismatch at ``globals.loss`` for ``minimize_fn`` to minimise.
-
-    With `max_disp` set, the position is capped to ``|pos_k − x0| < max_disp`` via a
-    smooth tanh reparametrisation (see `_bound_disp`), so BFGS can never drive the atom
-    into far, degenerate geometries.
-
-    If `recorder` is given, it is invoked on the host at EVERY evaluation (incl. BFGS
-    line-search probes, not just accepted steps) with (pos_k, loss, spectrum) via
-    ``jax.debug.callback(..., ordered=True)`` — the ACTUAL (bounded) pos_k, so the
-    recorded trajectory reflects the real positions. That callback is transparent to
-    autodiff, so jopt still differentiates the loss on device exactly as before.
-    """
-    n_atoms = specs[0].weights.shape[0]
-    x0j = None if x0 is None else jnp.asarray(x0)
-
-    def fun(graph):
-        u     = graph.globals["pos_k"].reshape(3)
-        pos_k = _bound_disp(u, x0j, max_disp, jnp)
-        # positions come from graph_from_ase as a numpy array (graph0 is a closed-over
-        # constant, not a jitted arg), so cast to jnp before the functional update.
-        pos   = jnp.asarray(graph.nodes["positions"]).at[atom_k].set(pos_k)
-        g     = gcnn.experimental.update_graph(graph).set(("nodes", "positions"), pos).get()
-        out   = module._model.apply(params, g)
-        pred  = out.nodes["predicted_nmr_tensors"][:n_atoms]
-        loss  = spectral_loss(pred, specs)
-        if recorder is not None:
-            jax.debug.callback(recorder, pos_k, loss, species_spectrum(pred, specs[0]),
-                               ordered=True)
-        return gcnn.experimental.update_graph(out).set(("globals", "loss"),
-                                                       loss.reshape(1)).get()
-
-    return fun
+    pos_arr = np.asarray(positions, dtype=np.float32).reshape(-1, 3)
+    out = []
+    for i in range(0, len(pos_arr), chunk):
+        block = pos_arr[i:i + chunk]
+        pad = chunk - len(block)
+        if pad:
+            block = np.concatenate([block, np.repeat(block[-1:], pad, axis=0)])
+        res = np.asarray(_spec(jnp.asarray(block)))
+        out.append(res[:chunk - pad] if pad else res)
+    return np.concatenate(out, axis=0)
 
 
-_GRAD_CHECKED = False   # whether the gradient has already been finite-diff-verified
-
-
-def _grad_check(vg, to_graph, atoms_base, atom_k, x0, eps=1e-3):
-    """Finite-difference check of the JAX gradient at x0.
-
-    Confirms that pos_k → loss is actually differentiable (i.e. the model
-    recomputes edge vectors from positions). A near-zero JAX gradient or a large
-    relative error means autodiff is NOT flowing back to pos_k.
-    """
-    x = np.asarray(x0, dtype=np.float64).reshape(3)
-
-    # Use ONE fixed graph (topology fixed at x0) for both the analytic gradient and
-    # the finite differences, so they are comparable. (Rebuilding the neighbor list
-    # per probe would let x±eps straddle a topology change and corrupt the FD.)
-    a0 = atoms_base.copy()
-    a0.positions[atom_k] = x
-    graph0 = to_graph(a0)
-
-    def loss_only(xv):
-        (lv, _), _ = vg(graph0, jnp.asarray(xv, dtype=jnp.float32))
-        return float(lv)
-
-    (_, _), g_jax = vg(graph0, jnp.asarray(x, dtype=jnp.float32))
-    g_jax = np.asarray(g_jax, dtype=np.float64)
-
-    g_fd = np.array([(loss_only(x + eps * e) - loss_only(x - eps * e)) / (2 * eps)
-                     for e in np.eye(3)])
-    rel = np.linalg.norm(g_jax - g_fd) / (np.linalg.norm(g_fd) + 1e-12)
-    print(f"    grad check @ x0:  |JAX|={np.linalg.norm(g_jax):.4f}  "
-          f"|FD|={np.linalg.norm(g_fd):.4f}  rel.err={rel:.2e}")
-    # A steep landscape + float32 model make the central-difference reference
-    # itself noisy (truncation/round-off), so rel.err up to ~0.2 is expected and
-    # benign. The real failure mode is a ~0 analytic gradient (autodiff not
-    # reaching pos_k) or a gross mismatch.
-    if np.linalg.norm(g_jax) < 1e-6:
-        print("    ⚠ JAX gradient is ~0 — autodiff is NOT reaching pos_k (edges not "
-              "recomputed?).")
-    elif rel > 0.4:
-        print(f"    ⚠ gradient mismatch (rel.err {rel:.2e}) — autodiff path suspect.")
-    else:
-        note = "  (float32 FD noise)" if rel > 0.1 else ""
-        print(f"    gradient OK ✓{note}")
-
-
-_RESTART_RNG = np.random.default_rng(SEED + 1)   # seeds the multistart jitter (reproducible)
+_RESTART_RNG = np.random.default_rng(SEED + 1)   # seeds the multistart starts (reproducible)
 
 
 def optimize_position(module, params, to_graph, atoms_base, atom_k,
                       specs, x0, pos_true):
-    """Recover atom k's position with the supervisor's on-device minimiser
-    (``minimize_fn``: ``gcnn.adapt`` + ``jax.scipy.optimize.minimize``, BFGS).
+    """Recover atom k's position: `N_STARTS` parallel Adam descents (shared
+    `structure_search` engine), best OBSERVED loss wins.
 
-    atom k's position lives in a custom ``globals.pos_k`` field that the loss
-    GraphFunction injects into ``nodes.positions`` before running the model, so we
-    optimise exactly those 3 DOF, fully on device (fixed topology, built once at
-    the start). The loss+gradient stay 100% jitted JAX on device; a host
-    ``jax.debug.callback`` (AD-transparent) records EVERY evaluation into ``traj``
-    and — if PRINT_EVALS — prints live progress, so the plots/GIF get the full path
-    even though jopt itself exposes no per-iteration hook.
+    `x0` is the prior on where the atom is — the perturbed position in this benchmark, a
+    candidate site in a real refinement. `N_STARTS` starts are drawn in a ball of
+    `START_RADIUS` around it and descended simultaneously by a vmapped Adam; each stays
+    within `LOCAL_CAP` of its own start, and the neighbour list is rebuilt every step so
+    the periodic topology follows the atom. Selection sees the LOSS alone (no ground
+    truth); clustering / degeneracy use the minimum-image convention (periodic cell).
 
-    Runs up to ``N_RESTARTS`` BFGS attempts from jittered starts and returns the one
-    with the LOWEST final loss (multistart), stopping early once a run beats
-    ``RESTART_LOSS_TOL``. Since we can only observe the loss (no ground truth), the
-    loss is the selection criterion.
-
-    Returns dict(result, traj, n_evals, n_runs).
+    `pos_true` is used ONLY for printing and the returned diagnostics. Returns dict(pos,
+    loss, traj, loss_at_guess, n_evals, n_starts, n_valid, alternatives, hits, rebuild).
     """
-    global _GRAD_CHECKED
-    x0_arr   = np.asarray(x0, dtype=np.float64).reshape(3)
+    x0_arr = np.asarray(x0, dtype=np.float64).reshape(3)
     pos_true_arr = np.asarray(pos_true, dtype=np.float64).reshape(3)
+    other_pos = np.delete(np.asarray(atoms_base.positions, dtype=np.float64), atom_k, axis=0)
+    cell = np.asarray(atoms_base.cell) if bool(np.any(atoms_base.pbc)) else None
+    cfg_s = ss.SearchConfig(
+        adam_steps=ADAM_STEPS, adam_lr0=ADAM_LR0, adam_lr1=ADAM_LR1,
+        local_cap=LOCAL_CAP if LOCAL_CAP is not None else 1e9,
+        min_dist_guard=MIN_DIST_GUARD, guard_margin=GUARD_MARGIN, guard_weight=GUARD_WEIGHT,
+        starts_per_batch=STARTS_PER_BATCH, dist_threshold=DIST_THRESHOLD,
+        degeneracy_sep=DEGENERACY_SEP, degeneracy_tol=DEGENERACY_TOL)
+    loss_fn = lambda pred: spectral_loss(pred, specs)   # ties the engine to the spectra
 
-    if GRAD_CHECK and not _GRAD_CHECKED:
-        _GRAD_CHECKED = True
-        vg = make_value_and_grad(module, params, atom_k, specs,
-                                 x0=x0_arr, max_disp=MAX_DISPLACEMENT)
-        _grad_check(vg, to_graph, atoms_base, atom_k, x0_arr)
+    # The prior itself is always one of the starts, so the multistart can never do worse
+    # than a single run from the guess.
+    starts = ss.sample_ball_starts(x0_arr, other_pos, N_STARTS, START_RADIUS, cfg_s,
+                                   _RESTART_RNG)
+    starts[0] = x0_arr
 
-    def _jittered_start():
-        """A valid start = x0 + Gaussian jitter, kept away from other atoms (and
-        from their periodic images — see `min_image_distances`)."""
-        for _ in range(MAX_PERTURB_ATTEMPTS):
-            cand = x0_arr + _RESTART_RNG.normal(scale=RESTART_JITTER, size=3)
-            dists = min_image_distances(atoms_base, atom_k, pos_k=cand, others_only=True)
-            if dists.min() >= MIN_DIST:
-                return cand
-        return x0_arr.copy()
+    # One rebuilder per structure (captures cell/pbc and the slot capacity, fixed for the
+    # run). Size the capacity against a spread of the starts so it covers the roam.
+    rebuild = None
+    if LIVE_NEIGHBOURS:
+        probes = [np.where(np.arange(len(atoms_base))[:, None] == atom_k, s, atoms_base.positions)
+                  for s in starts[:min(16, len(starts))]]
+        rebuild, _capacity = ss.make_neighbour_rebuilder(
+            atoms_base, float(cfg.data.r_max), NEIGHBOUR_CAPACITY, probe_positions=probes)
 
-    def _single_run(start, run_idx):
-        """One BFGS minimisation from `start`; returns (result_with_pos_x, traj)."""
-        # Fixed-topology graph at the start point, carrying the custom pos_k global.
-        a0 = atoms_base.copy()
-        a0.positions[atom_k] = start
-        graph0 = to_graph(a0)
-        graph0 = gcnn.experimental.update_graph(graph0).set(
-            ("globals", "pos_k"), jnp.asarray(start, dtype=jnp.float32)).get()
-
-        traj = dict(positions=[], loss=[], spectra=[])
-
-        def _record(pos_k, loss, spectrum):
-            pos_k = np.asarray(pos_k, dtype=np.float64)
-            loss  = float(loss)
-            traj["positions"].append(pos_k)
-            traj["loss"].append(loss)
-            traj["spectra"].append(np.asarray(spectrum, dtype=np.float64))
-            if PRINT_EVALS:
-                dpos = float(np.linalg.norm(pos_k - pos_true_arr))
-                tag  = f"[run {run_idx}] " if N_RESTARTS > 1 else ""
-                print(f"    {tag}eval {len(traj['loss']):4d}: "
-                      f"loss={loss:9.4f}   |Δpos|={dpos:.4f} Å", flush=True)
-
-        # The supervisor's minimiser applied to our spectral loss GraphFunction.
-        fun    = make_loss_graph_fn(
-            module, params, atom_k, specs,
-            recorder=_record, x0=start, max_disp=MAX_DISPLACEMENT,
+    out = ss.run_multistart(module, params, to_graph, atoms_base, atom_k, loss_fn, starts,
+                            cfg_s, rebuild=rebuild)
+    losses = out["losses"]
+    positions_out = out["positions"]
+    all_losses = out["all_losses"]
+    all_pos = out["all_pos"]
+    finite = np.where(np.isfinite(losses), losses, np.inf)
+    n_valid = int(np.isfinite(finite).sum())
+    if n_valid == 0:
+        raise RuntimeError(
+            "every start ended on an invalid geometry — check MIN_DIST_GUARD/START_RADIUS."
         )
-        minim  = minimize_fn(fun, what="globals.loss", wrt="globals.pos_k")
-        result = minim(graph0, jnp.asarray(start, dtype=jnp.float32),
-                       method="BFGS", options=dict(maxiter=MAX_ITER))
-        # BFGS optimises the unconstrained variable u; map it back to the real
-        # (bounded) position and store it in result.x so downstream reads a position.
-        pos_rec = _bound_disp(np.asarray(result.x, dtype=np.float64).reshape(3),
-                              start, MAX_DISPLACEMENT, np)
-        result  = result._replace(x=pos_rec)
+    i_best = int(np.argmin(finite))
 
-        # …but do not trust that answer. `jax.scipy.optimize`'s BFGS can return an `x`
-        # that is inconsistent with its own `fun` when the line search fails (status >= 2,
-        # the normal outcome on this landscape): measured on one CSH run, the loss at the
-        # returned x was 42.47 while res.fun claimed 4.31, and the returned point had
-        # never been evaluated at all. The recorder captured EVERY evaluation, so take
-        # the best point actually seen — BFGS evaluates each iterate, so nothing better
-        # than this exists in the run. Selection is on the loss alone, which is all a
-        # real deployment can observe.
-        losses = np.asarray(traj["loss"], dtype=np.float64)
-        if losses.size:
-            finite = np.where(np.isfinite(losses), losses, np.inf)
-            i_best = int(np.argmin(finite))
-            if np.isfinite(finite[i_best]):
-                result = result._replace(
-                    x=np.asarray(traj["positions"][i_best], dtype=np.float64),
-                    fun=finite[i_best],
-                )
-        return result, traj
+    # Trajectory of the winning start, for the plots and the GIF (spectra filled on demand).
+    traj = dict(
+        positions=[np.asarray(p, dtype=np.float64) for p in np.asarray(all_pos)[i_best]],
+        loss=[float(v) for v in np.asarray(all_losses)[i_best]],
+        spectra=[],
+    )
 
-    best = None
-    total_evals = 0
-    n_runs = 0
-    # There is always at least one run: N_RESTARTS <= 1 just means "no restarts".
-    for run_idx in range(max(1, N_RESTARTS)):
-        start = x0_arr if run_idx == 0 else _jittered_start()
-        result, traj = _single_run(start, run_idx)
-        n_runs      += 1
-        total_evals += int(result.nfev)
+    # Observable degeneracy check (min-image), plus a ground-truth diagnostic kept apart.
+    clusters = ss.cluster_minima(finite, positions_out, cfg_s, cell=cell)
+    alternatives = ss.find_degenerate_alternatives(clusters, cfg_s, cell=cell)
+    hits = int(sum(ss.mic_distance(p, pos_true_arr, cell) < DIST_THRESHOLD
+                   for p in positions_out))
+    loss_at_guess = float(all_losses[0][0])   # starts[0] is the prior guess itself
 
-        lossf  = float(result.fun)
-        rmsd_f = float(np.linalg.norm(np.asarray(result.x) - pos_true))
-        loss0  = traj["loss"][0] if traj["loss"] else float("nan")
-        rmsd0  = float(np.linalg.norm(start - pos_true))
-        tag    = f"run {run_idx}: " if N_RESTARTS > 1 else f"{METHOD_LABEL}: "
-        print(f"    {tag}{int(result.nfev)} evals  loss "
-              f"{loss0:8.3f} → {lossf:8.3f}  |Δr| {rmsd0:.4f} → {rmsd_f:.4f} Å"
-              f"  (status={int(result.status)}, success={bool(result.success)})")
+    if PRINT_EVALS:
+        order = np.argsort(finite)[:10]
+        for rank, i in enumerate(order):
+            print(f"      start {int(i):3d} (rank {rank}): loss {finite[i]:8.3f}  "
+                  f"|Δr| {ss.mic_distance(positions_out[i], pos_true_arr, cell):.4f} Å")
 
-        if best is None or lossf < best["loss_final"]:
-            best = dict(result=result, traj=traj, loss_final=lossf)
-        if lossf < RESTART_LOSS_TOL:
-            break   # good enough — no need to restart
+    rmsd_b = float(ss.mic_distance(positions_out[i_best], pos_true_arr, cell))
+    rmsd0 = float(ss.mic_distance(x0_arr, pos_true_arr, cell))
+    print(f"    {METHOD_LABEL}: {N_STARTS} starts x {ADAM_STEPS} steps  "
+          f"loss {loss_at_guess:8.3f} -> {finite[i_best]:8.3f}  "
+          f"|dr| {rmsd0:.4f} -> {rmsd_b:.4f} A  "
+          f"({hits}/{N_STARTS} starts reached the true basin)", flush=True)
+    if alternatives:
+        alt_txt = ", ".join(f"{d:.2f} A (loss {l:.3f})" for d, l in alternatives[:3])
+        print(f"    DEGENERATE: {len(alternatives)} distinct position(s) fit within "
+              f"{100 * DEGENERACY_TOL:.0f}% of the best loss - {alt_txt}")
+        print(f"      the spectrum does not determine this site; treat as unresolved.")
 
-    if N_RESTARTS > 1:
-        rmsd_b = float(np.linalg.norm(np.asarray(best["result"].x) - pos_true))
-        print(f"    best of {n_runs} run(s): loss {best['loss_final']:.3f} ppm  "
-              f"|Δr| {rmsd_b:.4f} Å", flush=True)
-
-    return dict(result=best["result"], traj=best["traj"],
-                n_evals=total_evals, n_runs=n_runs)
+    return dict(pos=positions_out[i_best], loss=float(finite[i_best]), traj=traj,
+                loss_at_guess=loss_at_guess, n_evals=N_STARTS * ADAM_STEPS,
+                n_starts=N_STARTS, n_valid=n_valid, alternatives=alternatives,
+                hits=hits, rebuild=rebuild)
 
 
 # Sanity check
@@ -1080,17 +931,17 @@ x0   = pos_pert.copy().flatten()
 best = optimize_position(
     module, params, to_graph, atoms_orig, atom_k, specs, x0, pos_true,
 )
-result = best["result"]
 traj   = best["traj"]
 
-pos_recovered = result.x.reshape(3)
-rmsd          = float(np.linalg.norm(pos_recovered - pos_true))
-# REAL success = the atom is back near its true position (positional |Δr| in Å),
-# independent of any optimiser convergence flag.
+_cell_main = np.asarray(atoms_orig.cell) if bool(np.any(atoms_orig.pbc)) else None
+pos_recovered = np.asarray(best["pos"]).reshape(3)
+rmsd          = float(ss.mic_distance(pos_recovered, pos_true, _cell_main))
+# REAL success = the atom is back near its true position (positional |Δr| in Å,
+# minimum-image), independent of any optimiser convergence flag.
 recovered  = bool(rmsd < DIST_THRESHOLD)
 n_evals    = best["n_evals"]
-loss_init  = traj["loss"][0] if traj["loss"] else float("nan")
-loss_final = float(result.fun)
+loss_init  = best["loss_at_guess"]
+loss_final = float(best["loss"])
 
 print(f"    optimiser: {METHOD_LABEL}  ({n_evals} evals total)")
 print(f"    loss: {loss_init:.6f} → {loss_final:.6f}")
@@ -1210,12 +1061,16 @@ if SAVE_CSV:
         w.writerow([MOL_IDX, atom_k, f"{displacement:.6f}",
                     n_evals, f"{loss_init:.8f}",
                     f"{loss_final:.8f}", f"{rmsd:.6f}",
-                    recovered, result.success])
+                    recovered, bool(loss_final < RELIABLE_LOSS_TOL)])
     print(f"  Summary CSV saved to {CSV_SUMMARY_PATH}")
 
 # ── GIF ───────────────────────────────────────────────────────────────────────
 if SAVE_GIF:
     print(f"  Saving GIF → {GIF_PATH} …")
+    # The vmapped Adam does not record per-step spectra; recompute them for the winning
+    # trajectory only (one forward pass per frame) so the spectrum panel animates.
+    traj["spectra"] = list(trajectory_spectra(
+        module, params, atom_k, specs, atoms_orig, traj["positions"], rebuild=best["rebuild"]))
     save_gif(
         traj, atoms_orig, positions, pos_true, pos_pert,
         n_atoms, atom_k, displacement,
@@ -1246,7 +1101,7 @@ else:
     rng_stat = np.random.default_rng(SEED + 100)
     # Lists are appended in case order, index-aligned with stat_meta.
     #   success  = |Δr| < DIST_THRESHOLD                       (needs ground truth)
-    #   reliable = success AND loss_final < RESTART_LOSS_TOL   (observable-only proxy)
+    #   reliable = success AND loss_final < RELIABLE_LOSS_TOL  (observable-only proxy)
     stats     = dict(dist=[], loss=[], n_evals=[], n_runs=[], success=0, reliable=0, total=0)
     stat_meta = dict(mol=[], atom=[], species=[], dist0=[])   # one row per accepted case
 
@@ -1283,15 +1138,16 @@ else:
                 module, params, to_graph, atoms_i, k_i, specs_i,
                 pos_pert_i.flatten(), pos_i[k_i],
             )
-            dist_i = float(np.linalg.norm(best_i["result"].x.reshape(3) - pos_i[k_i]))
-            loss_i = float(best_i["result"].fun)
+            cell_i = np.asarray(atoms_i.cell) if bool(np.any(atoms_i.pbc)) else None
+            dist_i = float(ss.mic_distance(np.asarray(best_i["pos"]).reshape(3), pos_i[k_i], cell_i))
+            loss_i = float(best_i["loss"])
             stats["dist"].append(dist_i)
             stats["loss"].append(loss_i)
             stats["n_evals"].append(best_i["n_evals"])
-            stats["n_runs"].append(best_i["n_runs"])
+            stats["n_runs"].append(best_i["n_starts"])
             stats["total"] += 1
             ok_dist = dist_i < DIST_THRESHOLD
-            ok_loss = loss_i < RESTART_LOSS_TOL
+            ok_loss = loss_i < RELIABLE_LOSS_TOL
             if ok_dist:
                 stats["success"] += 1
             if ok_dist and ok_loss:
@@ -1299,8 +1155,8 @@ else:
 
             flag = "✓ reliable" if (ok_dist and ok_loss) else ("~ close" if ok_dist else "✗ miss")
             print(f"  mol {mol_i:2d}  atom {k_i:2d} ({stat_meta['species'][-1]}) → "
-                  f"|Δr|={dist_i:.3f} Å  loss={loss_i:.2f} ppm  "
-                  f"(runs={best_i['n_runs']})  {flag}")
+                  f"|Δr|={dist_i:.3f} Å  loss={loss_i:.2f}  "
+                  f"(starts={best_i['n_starts']})  {flag}")
 
     print("\n── Summary ──────────────────────────────────────────────────────────")
     if stats["total"] == 0:
@@ -1312,13 +1168,13 @@ else:
         )
         print(
             f"  reliable rate = {stats['reliable']}/{stats['total']} "
-            f"(|Δr| < {DIST_THRESHOLD} Å AND loss < {RESTART_LOSS_TOL} ppm)"
+            f"(|Δr| < {DIST_THRESHOLD} Å AND loss < {RELIABLE_LOSS_TOL})"
         )
         print(
             f"  median |Δr| = {np.median(stats['dist']):.3f} Å  |  "
             f"mean |Δr| = {np.mean(stats['dist']):.3f} Å  |  "
             f"mean evals = {np.mean(stats['n_evals']):.0f}  |  "
-            f"mean runs = {np.mean(stats['n_runs']):.1f}"
+            f"mean starts = {np.mean(stats['n_runs']):.1f}"
         )
 
     # ── Statistics figure (4 panels) ──────────────────────────────────────────
@@ -1340,7 +1196,7 @@ else:
                             f"{d:.6f}", f"{l:.8f}",
                             stats["n_evals"][i], stats["n_runs"][i],
                             bool(d < DIST_THRESHOLD),
-                            bool(d < DIST_THRESHOLD and l < RESTART_LOSS_TOL)])
+                            bool(d < DIST_THRESHOLD and l < RELIABLE_LOSS_TOL)])
         print(f"  Statistics CSV saved to {STAT_CSV_PATH}")
 
 print(f"\nDone.")

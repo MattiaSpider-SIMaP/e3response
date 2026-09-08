@@ -78,8 +78,8 @@ local/*
 data/*
 notebooks/*
 nmr_sensitivity/*
-structure_resolution/**/results/
-structure_resolution/**/results_non_grad_alg/
+**/results/
+**/results_*/
 
 NOTES.md
 

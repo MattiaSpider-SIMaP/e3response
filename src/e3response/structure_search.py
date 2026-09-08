@@ -143,7 +143,7 @@ def min_image_min_distance(pos_k, other_pos, cell=None):
 
 # ── live neighbour list ─────────────────────────────────────────────────────────
 
-def make_neighbour_rebuilder(atoms, r_max, capacity=None):
+def make_neighbour_rebuilder(atoms, r_max, capacity=None, probe_positions=None):
     """Return ``(rebuild, capacity)`` where ``rebuild(graph, positions) -> graph`` recomputes
     the neighbour list inside jit.
 
@@ -157,6 +157,12 @@ def make_neighbour_rebuilder(atoms, r_max, capacity=None):
     :param atoms: supplies the cell and pbc; only positions may change afterwards.
     :param r_max: the model's cutoff.
     :param capacity: slots per atom, or None to estimate and verify against ``atoms``.
+    :param probe_positions: extra full ``(n_atoms, 3)`` geometries to size the capacity
+        against. CRITICAL for grid search: the capacity is probed at the start geometry, but
+        an atom roaming the whole cell can gain neighbours elsewhere, and an overflow SILENTLY
+        drops them — corrupting the loss (a candidate's reported spectral mismatch stops being
+        its true one) and manufacturing spurious minima. Pass a spread of the geometries the
+        atom will actually visit so the capacity covers the worst case.
     """
     periodic = bool(np.any(atoms.pbc))
     finder = jax_neighbours.neighbour_finder(
@@ -166,18 +172,21 @@ def make_neighbour_rebuilder(atoms, r_max, capacity=None):
     )
     n_atoms = len(atoms)
     pos0 = jnp.asarray(atoms.positions, dtype=jnp.float32)
+    probes = [pos0] + [jnp.asarray(p, dtype=jnp.float32) for p in (probe_positions or [])]
 
     if capacity is None:
         # The density estimate is unreliable for a small molecule (it can exceed the atom
-        # count), so clamp it, then let the real geometry have the final say.
+        # count), so clamp it, then let the real geometries have the final say.
         capacity = min(int(finder.estimate_neighbours(pos0)), n_atoms)
-    probe = finder.get_neighbours(pos0, max_neighbours=capacity)
-    if bool(probe.did_overflow):
-        # + headroom: atom k gains neighbours as it moves, and an overflow is silent.
-        capacity = int(probe.actual_max_neighbours) + 8
-        probe = finder.get_neighbours(pos0, max_neighbours=capacity)
+    # Size the capacity against EVERY probe geometry, bumping to the worst case + headroom.
+    # A later probe needing even more re-triggers the bump, so the loop converges.
+    for pp in probes:
+        probe = finder.get_neighbours(pp, max_neighbours=capacity)
         if bool(probe.did_overflow):
-            raise RuntimeError(f"neighbour list still overflows at capacity {capacity}")
+            capacity = int(probe.actual_max_neighbours) + 8
+            probe = finder.get_neighbours(pp, max_neighbours=capacity)
+            if bool(probe.did_overflow):
+                raise RuntimeError(f"neighbour list still overflows at capacity {capacity}")
 
     def rebuild(graph, positions):
         nl = finder.get_neighbours(positions, max_neighbours=capacity)
