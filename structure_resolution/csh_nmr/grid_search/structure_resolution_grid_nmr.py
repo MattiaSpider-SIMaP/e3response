@@ -59,19 +59,13 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 import hydra
 import jax
 import jax.numpy as jnp
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation, PillowWriter
 import numpy as np
 import omegaconf
 import reax
-import scipy.optimize
 from tensorial import gcnn
 from tensorial.gcnn import atomic
-from tensorial.geometry import jax_neighbours
 
-from e3response import keys, nmr_spectra
+from e3response import keys, nmr_spectra, structure_search as ss, sr_viz
 
 logging.getLogger("reax").setLevel(logging.ERROR)
 logging.getLogger("jax").setLevel(logging.ERROR)
@@ -90,7 +84,7 @@ SPLIT    = "test"      # which partition to work on: "train" | "val" | "test" | 
 LIMIT    = None       # base dataset restriction, applied BEFORE splitting (None → use the
                       # run's own `limit`, required to reproduce ITS split exactly). Same
                       # syntax as before: int N, "n:m", or "n:m:step".
-SPLIT_LIMIT = None   # further restriction WITHIN the chosen SPLIT (ignored if SPLIT="full").
+SPLIT_LIMIT = 10   # further restriction WITHIN the chosen SPLIT (ignored if SPLIT="full").
 
 # Which structure and which atom to resolve.
 MOL_IDX = 0      # index into the chosen split (not the raw dataset)
@@ -116,7 +110,7 @@ GUARD_WEIGHT = 200.0  # penalty = GUARD_WEIGHT · (MIN_DIST_GUARD + GUARD_MARGIN
 # Defaults to "model" on CSH: the self-consistency test (loss@true ≡ 0) must pass BEFORE a
 # DFT- or experiment-referenced result is worth interpreting, otherwise a failure cannot be
 # attributed between the optimiser, the landscape and model error.
-LOSS_TARGET = "model"
+LOSS_TARGET = "dft"
 
 # ── Spectrum ──────────────────────────────────────────────────────────────────
 # Which nuclei are fitted. Each is an INDEPENDENT experiment: one spectrum and one loss
@@ -125,7 +119,7 @@ LOSS_TARGET = "model"
 # nucleus responds to where the Na sits, so each extra species buys equations. Adding "O"
 # is the most informative numerically and the least realistic physically (¹⁷O needs
 # enrichment). Species absent from a structure are skipped with a warning.
-SPECTRUM_SPECIES = ("Na", "Si")
+SPECTRUM_SPECIES = ("Na",)
 # Linewidth in ppm: a single float for all nuclei, or one value per species. ²³Na lines in
 # CSH are broad (quadrupolar, unmodelled here); ²⁹Si MAS lines are narrower.
 FWHM        = {"Na": 8.0, "Si": 3.0, "O": 8.0, "Ca": 8.0, "H": 2.0}
@@ -171,8 +165,7 @@ METHOD_LABEL = "adam+multistart"
 ADAM_STEPS   = 500     # iterations per start
 ADAM_LR0     = 0.08    # Å-scale step at the beginning (cosine-decayed to ADAM_LR1)
 ADAM_LR1     = 0.004   # final step: sets the resolution the answer is polished to
-GRAD_CHECK   = False   # finite-difference-verify the JAX gradient
-PRINT_EVALS  = False   # per-start progress. With a vmapped multistart this is a firehose;
+PRINT_EVALS  = True   # per-start progress. With a vmapped multistart this is a firehose;
                        # the per-start summary printed at the end is usually what you want.
 
 # Grid search. There is NO positional prior: the starts blanket the whole cell on a
@@ -190,7 +183,7 @@ PRINT_EVALS  = False   # per-start progress. With a vmapped multistart this is a
 # constant size in Å³ (a property of the model, not of the cell). N_STARTS is DERIVED per
 # structure from spacing and cell volume, and reported. Tune the spacing from the per-start
 # hit rate STEP 6 measures, exactly as N_STARTS was tuned on QM9.
-START_SPACING = 1.2   # Å — target spacing of the grid before clash rejection
+START_SPACING = 2   # Å — target spacing of the grid before clash rejection
 MAX_STARTS    = 4096  # safety cap on the raw grid; a huge cell + tiny spacing is refused
 # How many starts are in flight at once. `vmap` replicates the model's activations per lane
 # and reverse-mode AD holds them for the backward pass, so memory grows with lanes × atoms;
@@ -238,16 +231,16 @@ NEIGHBOUR_CAPACITY = None
 RELIABLE_LOSS_TOL = 2.0
 
 # Step 6 – statistics loop
-RUN_STATS      = True  # set False to skip the multi-molecule statistics loop
+RUN_STATS      = False  # set False to skip the multi-molecule statistics loop
 N_MOL_STAT     = 10     # how many molecules to include (ignored if RUN_STATS=False)
 N_ATOM_STAT    = 1      # atoms per molecule
 DIST_THRESHOLD = 0.2    # Å – "success" criterion
 
 # Output
 SAVE_CSV        = True   # write per-start + per-cluster CSVs
-SAVE_GIF        = False  # grid search has no single trajectory to animate; kept off. (The
-                         # per-start convergence map is the STEP 5 static plot instead.)
+SAVE_GIF        = True    # animate the descent paths of the best starts (3-D)
 SAVE_SPECTRA_CSV = True  # write the target vs best-cluster spectra as columns
+GIF_TOP_N       = 8      # how many of the lowest-final-loss paths to animate
 GIF_MAX_FRAMES  = 120    # subsample trajectory to at most this many animation frames
 GIF_FPS         = 15     # frames per second
 
@@ -294,129 +287,6 @@ def make_graph_builder(r_max: float):
     )
 
 
-def min_distance_to_others(graph, positions, atom_k):
-    """Distance from atom k to its closest other atom, minimum-image when periodic.
-
-    Traced (unlike `min_image_distances`, which is host-side ASE), so the loss itself can
-    check it. Non-finite positions propagate NaN, which fails every comparison — exactly
-    the behaviour the guard wants.
-    """
-    delta = positions - positions[atom_k]
-    if keys.CELL in graph.globals:
-        cell = jnp.asarray(graph.globals[keys.CELL]).reshape(3, 3)
-        frac = delta @ jnp.linalg.inv(cell)
-        delta = (frac - jnp.round(frac)) @ cell
-    dist = jnp.linalg.norm(delta, axis=-1).at[atom_k].set(jnp.inf)
-    return jnp.min(dist)
-
-
-def geometry_is_valid(positions, atom_k, graph, live):
-    """Is this a geometry whose loss means anything at all?
-
-    Only the two failures no gradient can repair. A degenerate geometry used to make the
-    model return inf/nan on its own, and inf/nan loses every comparison, so the optimiser
-    rejected it implicitly; a live neighbour search broke that, because a NaN position
-    merely DROPS atom k from every neighbour list and yields a perfectly finite loss for a
-    structure that is now missing an atom. Hence the explicit check:
-
-    - non-finite position;
-    - no neighbours at all — an atom driven far away is scored as an isolated atom, a
-      spurious flat minimum arbitrarily far from the truth.
-
-    Being too CLOSE to another atom is deliberately not handled here. It used to be, with
-    an `inf` wall at 0.8 Å, and that was actively harmful: an infinite plateau carries a
-    zero gradient, so the optimiser learns nothing about which way to escape, and at 0.8 Å
-    the wall cut through space the model handles fine (48/60 samples of mol 2's direct path
-    were declared invalid). `clash_penalty` replaces it with a finite, differentiable ramp.
-    """
-    valid = jnp.all(jnp.isfinite(positions[atom_k]))
-    if live:
-        n_atoms = positions.shape[0]
-        valid = valid & jnp.any(graph.edges[keys.MASK].reshape(n_atoms, -1)[atom_k])
-    return valid
-
-
-def clash_penalty(d_min):
-    """Smooth repulsion that keeps atom k out of the model's blow-up zone.
-
-    Takes the distance to the nearest other atom, not a graph: the caller must compute it
-    from the POSITIONS alone. Differentiating a penalty that reaches the distance through
-    the neighbour finder sends the gradient through `sqrt` of a zero self-distance, which
-    is NaN — and a NaN added to a clean spectral gradient poisons Adam's moments, killing
-    that start for the rest of the run. That bug cost the whole multistart: every lane
-    eventually went NaN and recovery fell from 6/10 to 0/10.
-
-    Zero everywhere except within `GUARD_MARGIN` of `MIN_DIST_GUARD`, where it grows
-    quadratically. Being finite and differentiable, its gradient points straight out of
-    the clash — unlike the `inf` it replaces, which told the optimiser only that it had
-    failed, not where to go. It is added to the loss, so the selection over starts still
-    cannot prefer a clashing geometry: at the guard itself the penalty is
-    GUARD_WEIGHT·GUARD_MARGIN² = 4.5, well above any loss reached at a correct position
-    (0.08–2.41 measured on this benchmark).
-    """
-    return GUARD_WEIGHT * jnp.square(
-        jnp.maximum(MIN_DIST_GUARD + GUARD_MARGIN - d_min, 0.0)
-    )
-
-
-def make_neighbour_rebuilder(atoms, r_max, capacity=None):
-    """Return ``rebuild(graph, positions) -> graph`` recomputing the neighbour list in jit.
-
-    `jax_neighbours` returns the list as a fixed ``(n_atoms, capacity)`` array padded with
-    ``-1``; this flattens it into jraph's edge layout and marks the empty slots through
-    ``edges.mask``, which `NequipLayer` uses to zero their contribution. Shapes never
-    change, so nothing recompiles as atoms move.
-
-    Membership is a discrete function of the positions, so no gradient flows through the
-    *choice* of neighbours — only through the edge vectors, exactly as with a frozen list.
-    The difference is that the choice is now correct at every step instead of being fixed
-    at the start of the run.
-
-    :param atoms: supplies the cell and pbc; only positions may change afterwards.
-    :param r_max: the model's cutoff.
-    :param capacity: slots per atom, or None to estimate and verify against `atoms`.
-    :return: ``(rebuild, capacity)``.
-    """
-    periodic = bool(np.any(atoms.pbc))
-    finder = jax_neighbours.neighbour_finder(
-        cutoff=float(r_max),
-        cell=np.asarray(atoms.cell) if periodic else None,
-        pbc=tuple(bool(x) for x in atoms.pbc) if periodic else None,
-    )
-    n_atoms = len(atoms)
-    pos0 = jnp.asarray(atoms.positions, dtype=jnp.float32)
-
-    if capacity is None:
-        # The density estimate is unreliable for a small molecule (it can exceed the atom
-        # count), so clamp it, then let the real geometry have the final say.
-        capacity = min(int(finder.estimate_neighbours(pos0)), n_atoms)
-    probe = finder.get_neighbours(pos0, max_neighbours=capacity)
-    if bool(probe.did_overflow):
-        # + headroom: atom k gains neighbours as it moves, and an overflow is silent.
-        capacity = int(probe.actual_max_neighbours) + 8
-        probe = finder.get_neighbours(pos0, max_neighbours=capacity)
-        if bool(probe.did_overflow):
-            raise RuntimeError(f"neighbour list still overflows at capacity {capacity}")
-
-    def rebuild(graph, positions):
-        nl = finder.get_neighbours(positions, max_neighbours=capacity)
-        neighbours = nl.neighbours                       # (n_atoms, capacity), -1 = empty
-        valid = neighbours != jax_neighbours.MASK_VALUE
-        edges = {keys.MASK: valid.reshape(-1)}
-        if keys.EDGE_CELL_SHIFTS in graph.edges:
-            edges[keys.EDGE_CELL_SHIFTS] = nl.cell_indices.reshape(-1, 3).astype(jnp.float32)
-        return graph._replace(
-            edges=edges,
-            # empty slots point at atom 0 and are masked out; `with_edge_vectors` replaces
-            # masked edge vectors with 1.0, so they cannot produce NaNs in the gradient.
-            senders=jnp.repeat(jnp.arange(neighbours.shape[0]), capacity),
-            receivers=jnp.where(valid, neighbours, 0).reshape(-1),
-            n_edge=jnp.array([neighbours.shape[0] * capacity]),
-        )
-
-    return rebuild, capacity
-
-
 def make_predictor(module, params, to_graph):
     """Return predict(atoms) → np.ndarray of shape (n_atoms, 3, 3).
 
@@ -436,19 +306,6 @@ def make_predictor(module, params, to_graph):
         return np.array(out.nodes["predicted_nmr_tensors"][:n_atoms])
 
     return predict
-
-
-def min_image_min_distance(pos_k, other_pos, cell=None):
-    """Host-side minimum distance from pos_k to any of `other_pos`, minimum-image if periodic.
-
-    Numpy, for the start-sampling rejection. `cell` is the 3×3 row-vector cell, or None
-    for a non-periodic system (plain Euclidean).
-    """
-    delta = other_pos - pos_k
-    if cell is not None:
-        frac = delta @ np.linalg.inv(cell)
-        delta = (frac - np.round(frac)) @ cell
-    return float(np.linalg.norm(delta, axis=1).min())
 
 
 def select_atom_k(atoms, n_atoms, atom_k_cfg, rng):
@@ -577,245 +434,6 @@ def compute_loss(pred_tensors, specs):
     return float(spectral_loss(jnp.asarray(pred_tensors), specs))
 
 
-def save_gif(traj, atoms_orig, positions, pos_true, pos_pert,
-             n_atoms, atom_k, displacement, loss_at_true, spec,
-             gif_path, max_frames=120, fps=15):
-    """Save an animated GIF of the optimisation trajectory.
-
-    Layout (2×2): left column = 3-D trajectory of atom k over the predicted vs target
-    SPECTRUM of the first fitted nucleus, animated in sync; right column = loss curve
-    and distance-to-true curve.
-    """
-    pos_hist    = np.array(traj["positions"])   # (n_evals, 3)
-    loss_curve  = np.array(traj["loss"])
-    spectra_hist = np.array(traj["spectra"])    # (n_evals, GRID_POINTS)
-    dists_hist  = np.linalg.norm(pos_hist - pos_true, axis=1)
-    n_evals     = len(loss_curve)
-
-    # Subsample to at most max_frames
-    if n_evals > max_frames:
-        frame_idxs = np.round(np.linspace(0, n_evals - 1, max_frames)).astype(int)
-    else:
-        frame_idxs = np.arange(n_evals)
-
-    p_mean  = positions.mean(axis=0)
-    _pos    = positions - p_mean
-    _anum   = np.array(atoms_orig.get_atomic_numbers())[:n_atoms]
-    color   = MODEL_COLOR
-
-    # 2×2 layout: left column = 3-D path (top) + spectra (bottom);
-    # right column = loss (top) + distance (bottom), stacked so there's no empty space.
-    fig = plt.figure(figsize=(10, 8), facecolor="white")
-    gs  = fig.add_gridspec(2, 2, wspace=0.30, hspace=0.30)
-    ax3d    = fig.add_subplot(gs[0, 0], projection="3d")
-    ax_spec = fig.add_subplot(gs[1, 0])                     # spectra, under the 3-D path
-    ax_loss = fig.add_subplot(gs[0, 1])
-    ax_dist = fig.add_subplot(gs[1, 1])                     # distance, under the loss
-
-    # ── static 3-D elements: atoms coloured by species, no bonds ──────────────
-    symbols = np.array(atoms_orig.get_chemical_symbols()[:n_atoms])
-    for sp in dict.fromkeys(symbols):          # unique species, first-seen order
-        m = symbols == sp
-        z = int(_anum[m][0])
-        ax3d.scatter(_pos[m, 0], _pos[m, 1], _pos[m, 2],
-                     s=_ATOM_SIZE.get(z, 40), c=_ATOM_COLOR.get(z, "violet"),
-                     edgecolors="#555555", linewidths=0.3, alpha=0.85,
-                     depthshade=True, label=sp)
-    p_true_c = pos_true - p_mean
-    p_pert_c = pos_pert - p_mean
-    ax3d.scatter(*p_true_c, s=200, c="limegreen", marker="*", zorder=5,
-                 label="true", edgecolors="k", linewidths=0.4)
-    ax3d.scatter(*p_pert_c, s=80,  c="orangered", marker="^", zorder=5,
-                 label="start", edgecolors="k", linewidths=0.4)
-    ax3d.legend(fontsize=6, loc="upper left")
-    ax3d.set_title(f"atom k={atom_k} trajectory", fontsize=8)
-    ax3d.tick_params(labelsize=5)
-
-    # ── animated elements ─────────────────────────────────────────────────────
-    trail_line, = ax3d.plot([], [], [], "-", color=color, alpha=0.5, linewidth=1.0)
-    cur_pt,     = ax3d.plot([], [], [], "o", color=color, markersize=9, zorder=6,
-                             markeredgecolor="k", markeredgewidth=0.5)
-
-    # loss panel
-    loss_line, = ax_loss.plot([], [], color=color, linewidth=1.5)
-    ax_loss.axhline(loss_at_true, color="limegreen", linestyle="--",
-                    linewidth=1.0, label="loss @ true pos")
-    ax_loss.set_xlim(0, n_evals)
-    # Ignore non-finite losses (a step can land on a geometry `geometry_is_valid`
-    # rejects, which scores inf) when setting limits.
-    finite = loss_curve[np.isfinite(loss_curve) & (loss_curve > 0)]
-    ymin = max(finite.min() * 0.9, 1e-6) if finite.size else 1e-6
-    ymax = finite.max() * 1.15 if finite.size else 1.0
-    ax_loss.set_ylim(ymin, ymax)
-    ax_loss.set_yscale("log")
-    ax_loss.set_xlabel("Evaluation #", fontsize=8)
-    ax_loss.set_ylabel(f"spectral loss ({METRIC})", fontsize=8)
-    ax_loss.set_title("Loss curve", fontsize=8)
-    ax_loss.legend(fontsize=7)
-    ax_loss.tick_params(labelsize=7)
-
-    # distance panel
-    dist_line, = ax_dist.plot([], [], color=color, linewidth=1.5)
-    ax_dist.axhline(0.0, color="limegreen", linestyle="--",
-                    linewidth=1.0, label="true pos")
-    ax_dist.set_xlim(0, n_evals)
-    _dmax = dists_hist[np.isfinite(dists_hist)]
-    ax_dist.set_ylim(-0.02, (_dmax.max() * 1.15) if _dmax.size else 1.0)
-    # ax_dist.set_yscale("log")
-    ax_dist.set_xlabel("Evaluation #", fontsize=8)
-    ax_dist.set_ylabel("|pos_k − pos_true| (Å)", fontsize=8)
-    ax_dist.set_title("Distance to true pos", fontsize=8)
-    ax_dist.legend(fontsize=7)
-    ax_dist.tick_params(labelsize=7)
-
-    # spectra panel (under the 3-D path): green = target (static), model colour =
-    # predicted spectrum at the current step (animated). This is the quantity the
-    # optimiser actually sees — the 3-D path above is ground truth it has no access to.
-    grid = np.asarray(spec.grid)
-    target_y = np.asarray(spec.target)
-    # Forward-fill non-finite spectra (a line-search probe can land on a degenerate
-    # geometry where the model returns inf/nan) so the animation never breaks.
-    spectra_hist = spectra_hist.copy()
-    last_ok = target_y
-    for _t in range(len(spectra_hist)):
-        if np.all(np.isfinite(spectra_hist[_t])):
-            last_ok = spectra_hist[_t]
-        else:
-            spectra_hist[_t] = last_ok
-
-    ax_spec.plot(grid, target_y, color="limegreen", linewidth=1.6, label="target")
-    pred_line, = ax_spec.plot(grid, spectra_hist[frame_idxs[0]], color=color,
-                              linewidth=1.4, label="predicted")
-    ax_spec.invert_xaxis()          # NMR convention: shift decreases to the right
-    _ymax = max(float(target_y.max()), float(np.nanmax(spectra_hist))) * 1.15
-    ax_spec.set_ylim(0.0, _ymax if np.isfinite(_ymax) and _ymax > 0 else 1.0)
-    ax_spec.set_xlabel("δ (ppm)", fontsize=8)
-    ax_spec.set_ylabel("intensity", fontsize=8)
-    ax_spec.set_title(f"{spec.symbol} spectrum  (green=target, colour=pred)", fontsize=8)
-    ax_spec.legend(fontsize=7)
-    ax_spec.tick_params(labelsize=7)
-
-    step_txt = ax_loss.text(0.97, 0.95, "", transform=ax_loss.transAxes,
-                             ha="right", va="top", fontsize=7, color="gray")
-
-    fig.suptitle(
-        f"NMR structure resolution  –  mol {MOL_IDX}  atom k={atom_k}"
-        f"  |Δ|={displacement:.2f} Å",
-        fontsize=9,
-    )
-
-    def _update(fi):
-        i = frame_idxs[fi]
-        pts = pos_hist[:i + 1] - p_mean
-        trail_line.set_data_3d(pts[:, 0], pts[:, 1], pts[:, 2])
-        p = pts[-1]
-        cur_pt.set_data_3d([p[0]], [p[1]], [p[2]])
-        xs = np.arange(i + 1)
-        loss_line.set_data(xs, loss_curve[:i + 1])
-        dist_line.set_data(xs, dists_hist[:i + 1])
-        step_txt.set_text(f"step {i + 1}/{n_evals}  loss={loss_curve[i]:.4f}")
-        pred_line.set_ydata(spectra_hist[i])
-        return trail_line, cur_pt, loss_line, dist_line, step_txt, pred_line
-
-    anim = FuncAnimation(fig, _update, frames=len(frame_idxs),
-                         interval=1000 // fps, blit=False)
-    anim.save(gif_path, writer=PillowWriter(fps=fps))
-    plt.close(fig)
-
-
-def save_statistics_figure(s, stat_meta, threshold, target_label, optimiser, path):
-    """4-panel summary of the multi-molecule recovery test.
-
-    Panels:
-      (1) cumulative success curve – fraction of cases with |Δr| ≤ x (ECDF).
-      (2) recovery vs perturbation – final |Δr| against the initial |Δr| (dist0),
-          coloured by success; below the y=x line means the atom moved closer.
-      (3) identifiability          – loss vs |Δr|; low loss + high |Δr| = degenerate.
-      (4) |Δr| distribution        – histogram with the threshold and success rate.
-    """
-    if s["total"] == 0:
-        print("  [stats figure] no samples — skipping.")
-        return
-    dist    = np.asarray(s["dist"])
-    loss    = np.asarray(s["loss"])
-    dist0   = np.asarray(stat_meta["dist0"])
-    n_cases = len(dist)
-    rec     = dist < threshold
-    sr      = rec.mean()
-    floor   = 1e-3   # Å – clip for log axes (perfect recoveries land here)
-    C_MAIN, C_OK, C_BAD = "royalblue", "tab:green", "tab:red"
-
-    fig, axes = plt.subplots(2, 2, figsize=(13, 10), facecolor="white")
-    ax_ecdf, ax_rec = axes[0]
-    ax_id,   ax_hist = axes[1]
-
-    # ── (1) cumulative success curve ──────────────────────────────────────────
-    d = np.sort(dist)
-    y = np.arange(1, n_cases + 1) / n_cases
-    ax_ecdf.step(np.concatenate([[0.0], d]), np.concatenate([[0.0], y]),
-                 where="post", color=C_MAIN, linewidth=2)
-    ax_ecdf.axvline(threshold, color="k", linestyle="--", linewidth=1,
-                    label=f"threshold {threshold} Å")
-    ax_ecdf.set_xlabel("|Δr| threshold (Å)")
-    ax_ecdf.set_ylabel("fraction recovered  (|Δr| ≤ threshold)")
-    ax_ecdf.set_title(f"Cumulative success curve  (n={n_cases})")
-    ax_ecdf.set_ylim(0, 1.02)
-    ax_ecdf.legend(fontsize=8, loc="lower right")
-    ax_ecdf.grid(alpha=0.3)
-
-    # ── (2) recovery vs initial perturbation ──────────────────────────────────
-    x0d = np.clip(dist0, floor, None)
-    yfd = np.clip(dist, floor, None)
-    hi  = max(x0d.max(), yfd.max()) * 1.4
-    ax_rec.scatter(x0d[~rec], yfd[~rec], s=28, alpha=0.6, color=C_BAD,
-                   edgecolors="k", linewidths=0.3, label="missed")
-    ax_rec.scatter(x0d[rec], yfd[rec], s=28, alpha=0.7, color=C_OK,
-                   edgecolors="k", linewidths=0.3, label="recovered")
-    ax_rec.plot([floor, hi], [floor, hi], "k--", linewidth=1, label="y = x (no move)")
-    ax_rec.axhline(threshold, color="limegreen", linestyle=":", linewidth=1)
-    ax_rec.set_xscale("log"); ax_rec.set_yscale("log")
-    ax_rec.set_xlim(floor, hi); ax_rec.set_ylim(floor, hi)
-    ax_rec.set_xlabel("initial |Δr| (perturbation, Å)")
-    ax_rec.set_ylabel("final |Δr| (Å)")
-    ax_rec.set_title("Recovery vs perturbation size")
-    ax_rec.legend(fontsize=8, loc="upper left")
-    ax_rec.grid(alpha=0.3, which="both")
-
-    # ── (3) identifiability: loss vs |Δr| ─────────────────────────────────────
-    ax_id.scatter(yfd, np.clip(loss, 1e-6, None), s=28, alpha=0.6, color=C_MAIN,
-                  edgecolors="k", linewidths=0.3)
-    ax_id.axvline(threshold, color="k", linestyle="--", linewidth=1,
-                  label=f"threshold {threshold} Å")
-    ax_id.set_xscale("log"); ax_id.set_yscale("log")
-    ax_id.set_xlabel("|Δr| final (Å)")
-    ax_id.set_ylabel("loss final (RMSE, ppm)")
-    ax_id.set_title("Identifiability: loss vs position error")
-    ax_id.legend(fontsize=8)
-    ax_id.grid(alpha=0.3, which="both")
-
-    # ── (4) |Δr| distribution ─────────────────────────────────────────────────
-    ax_hist.hist(dist, bins=min(30, max(10, n_cases // 3)), color=C_MAIN, alpha=0.75,
-                 edgecolor="white")
-    ax_hist.axvline(threshold, color="k", linestyle="--", linewidth=1.2,
-                    label=f"threshold {threshold} Å")
-    ax_hist.set_xlabel("|Δr| final (Å)")
-    ax_hist.set_ylabel("count")
-    ax_hist.set_title(f"Position-error distribution  –  success {sr * 100:.0f}% "
-                      f"({rec.sum()}/{n_cases})")
-    ax_hist.legend(fontsize=8)
-    ax_hist.grid(alpha=0.3, axis="y")
-
-    fig.suptitle(
-        f"Structure-resolution statistics  –  {n_cases} cases  |  "
-        f"target={target_label}  |  optimiser={optimiser}",
-        fontsize=12,
-    )
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Statistics figure saved to {path}")
-
-
 # ── STEP 0: Load model ─────────────────────────────────────────────────────────
 
 if not os.path.isdir(RUN_DIR):
@@ -931,175 +549,6 @@ print(f"  LOCAL_CAP = {LOCAL_CAP:.2f} Å ({LOCAL_CAP_FACTOR}× spacing)")
 
 print(f"\n[STEP 3] Building loss function …")
 
-# ── The supervisor's on-device minimiser — NO LONGER USED, kept for reference ──
-# `gcnn.adapt(fun, wrt, outs=(what,))` wraps a graph function so it takes the optimised
-# quantity as a positional arg (injected at `wrt`) and returns the scalar at `what`;
-# `jax.scipy.optimize.minimize` then minimises it entirely on device. This was the
-# original driver and it is the canonical `gcnn.adapt` idiom, which is why it survives
-# here — but do not put it back without reading the note above `METHOD_LABEL`: its BFGS
-# returned `status=3` (line-search zoom failed) in 10 benchmark cases out of 10, never
-# once converging. `make_multistart_adam` replaced it. The `gcnn.adapt` wrapping itself
-# is fine; it is `jax.scipy.optimize`'s strong-Wolfe line search that cannot cope with a
-# float32 loss.
-from collections.abc import Callable          # noqa: E402
-from jax.scipy import optimize as jopt        # noqa: E402
-import tensorial                              # noqa: E402
-
-
-def minimize_fn(fun, what, wrt) -> Callable:
-    graph_fn = gcnn.adapt(fun, wrt, outs=(what,))
-
-    def minim(graph, x0, *, method, tol=None, options=None):
-        # optimize() only takes 1D arrays, so flatten and un-flatten
-        def to_minimize(value):
-            value = value.reshape(x0.shape)
-            return tensorial.as_array(graph_fn(graph, value)).flatten()[0]
-
-        res = jopt.minimize(to_minimize, x0.flatten(), method=method, tol=tol, options=options)
-        res = res._replace(x=res.x.reshape(x0.shape))
-        return res
-
-    return minim
-
-
-# ── Differentiable NMR loss + gradient (the actual, observable optimiser) ──────
-
-def _bound_disp(u, x0, max_disp, xp):
-    """Map the unconstrained optimiser variable `u` to a position whose displacement
-    from `x0` is smoothly capped at `max_disp`.
-
-    Radial (isotropic) tanh squashing: with ``d = u − x0`` and ``r = |d|``, returns
-    ``x0 + d · (R·tanh(r/R) / r)``, so the Euclidean displacement is
-    ``|pos − x0| = R·tanh(r/R) < R`` for any `u`, and small steps (r ≪ R) are left
-    essentially unchanged. Smooth everywhere (the +eps keeps r away from 0). `xp` is
-    the array module (``jnp`` inside the traced loss, ``np`` on the host).
-    ``max_disp=None`` → identity (raw, unbounded)."""
-    if max_disp is None:
-        return u
-    d = u - x0
-    r = xp.sqrt(xp.sum(d * d) + 1e-12)
-    return x0 + d * (max_disp * xp.tanh(r / max_disp) / r)
-
-
-def make_value_and_grad(module, params, atom_k, specs, x0=None, max_disp=None,
-                        rebuild=None):
-    """Build a JAX (loss, grad) function of atom k's optimiser variable.
-
-    Given a graph (fixed topology) and the optimiser variable, it maps it to a
-    (optionally displacement-bounded) position, injects it into the positions and
-    runs the model — whose ``EdgeVectors`` layer RECOMPUTES the edge vectors from the
-    positions, so reverse-mode autodiff flows all the way back. The tensors are then
-    turned into spectra and compared with the targets, so the gradient chain is
-    ``pos_k → tensors → spectra → loss`` and is exact for that topology. The predicted
-    spectrum of the first fitted nucleus is carried as aux (for the GIF).
-    """
-    n_atoms = specs[0].weights.shape[0]
-    x0j = None if x0 is None else jnp.asarray(x0)
-
-    def _loss(graph, u):
-        pos_k = _bound_disp(u, x0j, max_disp, jnp)
-        pos  = graph.nodes["positions"].at[atom_k].set(pos_k)
-        g    = gcnn.experimental.update_graph(graph).set(("nodes", "positions"), pos).get()
-        if rebuild is not None:
-            g = rebuild(g, pos)
-        out  = module._model.apply(params, g)
-        pred = out.nodes["predicted_nmr_tensors"][:n_atoms]
-        loss = jnp.where(geometry_is_valid(pos, atom_k, g, rebuild is not None),
-                         spectral_loss(pred, specs), jnp.inf)
-        return loss, species_spectrum(pred, specs[0])
-
-    return jax.jit(jax.value_and_grad(_loss, argnums=1, has_aux=True))
-
-
-def make_multistart_adam(module, params, atom_k, specs, atoms_base, rebuild=None):
-    """Return ``run(starts) -> (losses, positions, best_traj)``: one Adam descent per start,
-    all of them executed in parallel by ``jax.vmap``.
-
-    Structure of one descent: the optimiser variable ``u`` is mapped through `_bound_disp`
-    to a position at most `LOCAL_CAP` from *that start*, injected into the positions, the
-    neighbour list rebuilt (if live), the model run, and the predicted tensors turned into
-    spectra. Autodiff carries the gradient back along ``pos_k → tensors → spectra → loss``.
-
-    Two details that matter and are easy to get wrong:
-
-    * The model's gradient is scrubbed with `nan_to_num` and clipped BEFORE the clash
-      penalty's gradient is added. Below ~0.45 Å the model returns NaN derivatives, and a
-      NaN plus a finite repulsion is still NaN — the atom would be stuck in the clash
-      forever. Scrubbing to zero leaves the penalty as the only surviving force, which is
-      exactly the one that pushes it out.
-    * Selection is on the loss ALONE, never on the distance to the true position, because
-      a real experiment has no true position. `lax.scan` returns every step, so the best
-      point actually visited is taken rather than the last one, which is where the descent
-      happened to stop.
-
-    Compiles once per molecule: the graph shape is fixed and `starts` is a traced argument,
-    so adding starts costs GPU width, not recompilation.
-    """
-    n_atoms = specs[0].weights.shape[0]
-    graph_base = to_graph(atoms_base)
-    pos_all = jnp.asarray(atoms_base.positions, dtype=jnp.float32)
-
-    # Every atom but k is frozen, so the clash distance can be measured against a fixed
-    # array — no graph, no neighbour finder, no NaN gradient (see `clash_penalty`).
-    others = pos_all[jnp.array([i for i in range(n_atoms) if i != atom_k])]
-    _cell = np.asarray(atoms_base.cell) if bool(np.any(atoms_base.pbc)) else None
-    _cell_j = None if _cell is None else jnp.asarray(_cell, dtype=jnp.float32)
-    _icell_j = None if _cell is None else jnp.asarray(np.linalg.inv(_cell), dtype=jnp.float32)
-
-    def _min_dist(pos_k):
-        delta = others - pos_k
-        if _cell_j is not None:                      # minimum image, for periodic cells
-            frac = delta @ _icell_j
-            delta = (frac - jnp.round(frac)) @ _cell_j
-        return jnp.linalg.norm(delta, axis=-1).min()
-
-    def _spectral(u, start):
-        """Spectral loss, with the validity flag as aux so one forward pass serves both."""
-        pos_k = _bound_disp(u, start, LOCAL_CAP, jnp)
-        pos = pos_all.at[atom_k].set(pos_k)
-        g = gcnn.experimental.update_graph(graph_base).set(("nodes", "positions"), pos).get()
-        if rebuild is not None:
-            g = rebuild(g, pos)
-        out = module._model.apply(params, g)
-        loss = spectral_loss(out.nodes["predicted_nmr_tensors"][:n_atoms], specs)
-        return loss, geometry_is_valid(pos, atom_k, g, rebuild is not None)
-
-    def _penalty(u, start):
-        return clash_penalty(_min_dist(_bound_disp(u, start, LOCAL_CAP, jnp)))
-
-    lrs = ADAM_LR1 + 0.5 * (ADAM_LR0 - ADAM_LR1) * (
-        1.0 + jnp.cos(jnp.pi * jnp.arange(ADAM_STEPS) / ADAM_STEPS)
-    )
-
-    def one_run(start):
-        def step(carry, lr):
-            u, m, v, t = carry
-            (l, ok), g = jax.value_and_grad(_spectral, has_aux=True)(u, start)
-            # Scrub BOTH gradients before they touch Adam's moments: one NaN is enough to
-            # poison m and v permanently, and a poisoned lane produces NaN positions for
-            # the rest of the run.
-            g = jnp.clip(jnp.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0), -1e3, 1e3)
-            lp, gp = jax.value_and_grad(_penalty)(u, start)
-            gp = jnp.clip(jnp.nan_to_num(gp, nan=0.0, posinf=0.0, neginf=0.0), -1e3, 1e3)
-            g = g + gp
-            t = t + 1.0
-            m = 0.9 * m + 0.1 * g
-            v = 0.999 * v + 0.001 * g * g
-            u_next = u - lr * (m / (1 - 0.9 ** t)) / (jnp.sqrt(v / (1 - 0.999 ** t)) + 1e-8)
-            total = jnp.where(ok, l + lp, jnp.inf)
-            return (u_next, m, v, t), (total, _bound_disp(u, start, LOCAL_CAP, jnp))
-
-        init = (start, jnp.zeros(3), jnp.zeros(3), jnp.array(0.0))
-        _, (losses, poss) = jax.lax.scan(step, init, lrs)
-        # NOT jnp.nan_to_num: its `posinf` default silently rewrites the inf sentinel to
-        # 3.4e38, which passes every isfinite() check downstream and lets rejected
-        # geometries back into the selection and the degeneracy count.
-        losses = jnp.where(jnp.isnan(losses), jnp.inf, losses)
-        i = jnp.argmin(losses)
-        return losses[i], poss[i], losses, poss
-
-    return jax.jit(jax.vmap(one_run))
-
 
 def trajectory_spectra(module, params, atom_k, specs, atoms_base, positions,
                        rebuild=None, chunk=16):
@@ -1139,144 +588,17 @@ def trajectory_spectra(module, params, atom_k, specs, atoms_base, positions,
     return np.concatenate(out, axis=0)
 
 
-def mic_distance(a, b, cell=None):
-    """Minimum-image distance between two Cartesian points (numpy, host-side)."""
-    delta = np.asarray(a) - np.asarray(b)
-    if cell is not None:
-        frac = delta @ np.linalg.inv(cell)
-        delta = (frac - np.round(frac)) @ cell
-    return float(np.linalg.norm(delta))
-
-
-def sample_grid_starts(atoms, atom_k, spacing, cell, rng):
-    """Jittered regular grid over the cell, clash-free, at a target `spacing` (Å).
-
-    The number of points along fractional axis i is ``round(|cell_i| / spacing)``, so the
-    Cartesian step matches the requested spacing on each axis. Every grid point sits at the
-    centre of its sub-cell plus a uniform jitter of ±half a sub-cell, so it stays in its own
-    box: even coverage (unlike an i.i.d. cloud) with no alignment to the crystal symmetry
-    (unlike a plain grid). Points clashing with a framework atom — minimum-image distance
-    below the guard — are dropped; atom k's own row is excluded, since its position is what
-    we solve for.
-
-    Returns ``(starts, n_raw)``: the accepted Cartesian positions and the raw grid size
-    before rejection (so the caller can report the void fraction).
-    """
-    lengths = np.linalg.norm(cell, axis=1)
-    ns = np.maximum(1, np.round(lengths / spacing).astype(int))
-    n_raw = int(np.prod(ns))
-    if n_raw > MAX_STARTS:
-        sys.exit(f"grid would be {n_raw} points (> MAX_STARTS={MAX_STARTS}); "
-                 f"raise START_SPACING (now {spacing} Å) or MAX_STARTS.")
-
-    # Fractional lattice: centres (i+0.5)/n_i plus jitter in [-0.5/n_i, 0.5/n_i].
-    axes = [(np.arange(n) + 0.5) / n for n in ns]
-    frac = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
-    frac = frac + (rng.random((n_raw, 3)) - 0.5) / ns
-
-    other_pos = np.delete(np.asarray(atoms.positions, dtype=np.float64), atom_k, axis=0)
-    guard = MIN_DIST_GUARD + GUARD_MARGIN
-    cart = frac @ cell
-    keep = [p for p in cart if min_image_min_distance(p, other_pos, cell) >= guard]
-    if not keep:
-        raise RuntimeError(
-            "every grid point clashes with the framework — the cell is fully packed; "
-            "lower MIN_DIST_GUARD or reduce START_SPACING."
-        )
-    return np.asarray(keep, dtype=np.float64), n_raw
-
-
-def cluster_minima(losses, positions, cell=None):
-    """Group converged positions into distinct minima, best loss first.
-
-    Greedy, minimum-image: walk the starts in increasing loss, opening a new cluster
-    whenever a position is more than `DEGENERACY_SEP` from every cluster centre already
-    opened, otherwise attaching it to the nearest one. Each cluster's loss is its best
-    member's. Returns a list of dicts (centre, loss, size), sorted by loss.
-
-    This is the grid search's primary output. In a real refinement it is ALSO the only
-    degeneracy signal: if two clusters share a near-equal low loss but sit far apart, the
-    spectrum does not determine the site.
-    """
-    finite = np.where(np.isfinite(losses), losses, np.inf)
-    order = np.argsort(finite)
-    clusters = []
-    for i in order:
-        if not np.isfinite(finite[i]):
-            break
-        placed = False
-        for c in clusters:
-            if mic_distance(positions[i], c["centre"], cell) < DEGENERACY_SEP:
-                c["size"] += 1
-                placed = True
-                break
-        if not placed:
-            clusters.append(dict(centre=np.asarray(positions[i], dtype=np.float64),
-                                 loss=float(finite[i]), size=1))
-    return clusters
-
-
-def find_degenerate_alternatives(clusters, cell=None):
-    """Clusters whose loss rivals the best one — the observable degeneracy warning.
-
-    Returns ``(distance_from_best, loss)`` for every cluster beyond the first whose loss is
-    within `DEGENERACY_TOL` (relative) of the best. Non-empty ⇒ the site is not uniquely
-    determined by the spectrum and must be reported as unresolved.
-    """
-    if not clusters:
-        return []
-    best = clusters[0]
-    ceiling = best["loss"] * (1.0 + DEGENERACY_TOL) + 1e-12
-    return [(mic_distance(c["centre"], best["centre"], cell), c["loss"])
-            for c in clusters[1:] if c["loss"] <= ceiling]
-
-
-_GRAD_CHECKED = False   # whether the gradient has already been finite-diff-verified
-
-
-def _grad_check(vg, to_graph, atoms_base, atom_k, x0, eps=1e-3):
-    """Finite-difference check of the JAX gradient at x0.
-
-    Confirms that pos_k → loss is actually differentiable (i.e. the model
-    recomputes edge vectors from positions). A near-zero JAX gradient or a large
-    relative error means autodiff is NOT flowing back to pos_k.
-    """
-    x = np.asarray(x0, dtype=np.float64).reshape(3)
-
-    # Use ONE fixed graph (topology fixed at x0) for both the analytic gradient and
-    # the finite differences, so they are comparable. (Rebuilding the neighbor list
-    # per probe would let x±eps straddle a topology change and corrupt the FD.)
-    a0 = atoms_base.copy()
-    a0.positions[atom_k] = x
-    graph0 = to_graph(a0)
-
-    def loss_only(xv):
-        (lv, _), _ = vg(graph0, jnp.asarray(xv, dtype=jnp.float32))
-        return float(lv)
-
-    (_, _), g_jax = vg(graph0, jnp.asarray(x, dtype=jnp.float32))
-    g_jax = np.asarray(g_jax, dtype=np.float64)
-
-    g_fd = np.array([(loss_only(x + eps * e) - loss_only(x - eps * e)) / (2 * eps)
-                     for e in np.eye(3)])
-    rel = np.linalg.norm(g_jax - g_fd) / (np.linalg.norm(g_fd) + 1e-12)
-    print(f"    grad check @ x0:  |JAX|={np.linalg.norm(g_jax):.4f}  "
-          f"|FD|={np.linalg.norm(g_fd):.4f}  rel.err={rel:.2e}")
-    # A steep landscape + float32 model make the central-difference reference
-    # itself noisy (truncation/round-off), so rel.err up to ~0.2 is expected and
-    # benign. The real failure mode is a ~0 analytic gradient (autodiff not
-    # reaching pos_k) or a gross mismatch.
-    if np.linalg.norm(g_jax) < 1e-6:
-        print("    ⚠ JAX gradient is ~0 — autodiff is NOT reaching pos_k (edges not "
-              "recomputed?).")
-    elif rel > 0.4:
-        print(f"    ⚠ gradient mismatch (rel.err {rel:.2e}) — autodiff path suspect.")
-    else:
-        note = "  (float32 FD noise)" if rel > 0.1 else ""
-        print(f"    gradient OK ✓{note}")
-
 
 _RESTART_RNG = np.random.default_rng(SEED + 1)   # seeds the multistart (reproducible)
+
+
+def _search_config():
+    """Bundle this script's tuning constants into the shared engine's SearchConfig."""
+    return ss.SearchConfig(
+        adam_steps=ADAM_STEPS, adam_lr0=ADAM_LR0, adam_lr1=ADAM_LR1, local_cap=LOCAL_CAP,
+        min_dist_guard=MIN_DIST_GUARD, guard_margin=GUARD_MARGIN, guard_weight=GUARD_WEIGHT,
+        starts_per_batch=STARTS_PER_BATCH, dist_threshold=DIST_THRESHOLD,
+        degeneracy_sep=DEGENERACY_SEP, degeneracy_tol=DEGENERACY_TOL, max_starts=MAX_STARTS)
 
 
 def grid_search(module, params, to_graph, atoms_base, atom_k, specs, pos_true, cell):
@@ -1292,57 +614,52 @@ def grid_search(module, params, to_graph, atoms_base, atom_k, specs, pos_true, c
     cluster, all clusters, the degeneracy alternatives, and validation-only diagnostics
     (distance of the best cluster to truth, and how many starts fell in the true basin).
     """
-    global _GRAD_CHECKED
     pos_true_arr = np.asarray(pos_true, dtype=np.float64).reshape(3)
+    cfg = _search_config()
 
-    # One rebuilder per structure: it captures the cell/pbc and the slot capacity, both of
-    # which are fixed for the whole run — only the positions change.
-    rebuild = None
-    if LIVE_NEIGHBOURS:
-        rebuild, _capacity = make_neighbour_rebuilder(atoms_base, R_MAX, NEIGHBOUR_CAPACITY)
-
-    if GRAD_CHECK and not _GRAD_CHECKED:
-        _GRAD_CHECKED = True
-        vg = make_value_and_grad(module, params, atom_k, specs,
-                                 x0=pos_true_arr, max_disp=LOCAL_CAP, rebuild=rebuild)
-        _grad_check(vg, to_graph, atoms_base, atom_k, pos_true_arr)
-
-    starts, n_raw = sample_grid_starts(atoms_base, atom_k, START_SPACING, cell, _RESTART_RNG)
+    starts, n_raw = ss.sample_grid_starts(atoms_base, atom_k, START_SPACING, cell, cfg,
+                                          _RESTART_RNG)
     n_starts = len(starts)   # derived: raw grid minus clash rejections
     void_frac = n_starts / max(n_raw, 1)
 
-    run = make_multistart_adam(module, params, atom_k, specs, atoms_base, rebuild=rebuild)
-    # Batched so the activation footprint is set by STARTS_PER_BATCH, not by n_starts.
-    # A ragged final batch is padded up to full width rather than triggering a second
-    # compilation for its shape.
-    batch = min(STARTS_PER_BATCH, n_starts)
-    chunks = []
-    for i in range(0, n_starts, batch):
-        block = starts[i:i + batch]
-        pad = batch - len(block)
-        if pad:
-            block = np.concatenate([block, np.repeat(block[-1:], pad, axis=0)])
-        bl, bp, _, _ = run(jnp.asarray(block, dtype=jnp.float32))
-        keep = batch - pad
-        chunks.append((np.asarray(bl)[:keep], np.asarray(bp)[:keep]))
+    # Size the neighbour capacity against geometries spread across the CELL, not just the
+    # start geometry — otherwise the roaming atom overflows it silently and the per-candidate
+    # loss is computed on an incomplete list (see make_neighbour_rebuilder / the topology
+    # check in STEP 4). Build full geometries with atom k placed at a subsample of starts.
+    rebuild = None
+    if LIVE_NEIGHBOURS:
+        sub = starts[np.random.default_rng(0).choice(
+            n_starts, min(16, n_starts), replace=False)]
+        probes = []
+        for s in sub:
+            p = np.asarray(atoms_base.positions, dtype=np.float64).copy()
+            p[atom_k] = s
+            probes.append(p)
+        rebuild, _capacity = ss.make_neighbour_rebuilder(
+            atoms_base, R_MAX, NEIGHBOUR_CAPACITY, probe_positions=probes)
 
-    losses = np.concatenate([c[0] for c in chunks]).astype(np.float64)      # (n_starts,)
-    positions_out = np.concatenate([c[1] for c in chunks]).astype(np.float64)
-    finite = np.where(np.isfinite(losses), losses, np.inf)
+    loss_fn = lambda pred: spectral_loss(pred, specs)     # ties the engine to the spectra
+    out = ss.run_multistart(module, params, to_graph, atoms_base, atom_k, loss_fn, starts,
+                            cfg, rebuild=rebuild)
+    losses = out["losses"]                 # (n_starts,), inf where invalid
+    positions_out = out["positions"]       # (n_starts, 3)
+    all_losses = out["all_losses"]         # (n_starts, ADAM_STEPS) — kept for the GIF
+    all_pos = out["all_pos"]               # (n_starts, ADAM_STEPS, 3)
+    finite = losses
     n_valid = int(np.isfinite(finite).sum())
     if n_valid == 0:
         raise RuntimeError(
             "every start ended on an invalid geometry — check MIN_DIST_GUARD/START_SPACING."
         )
 
-    clusters = cluster_minima(finite, positions_out, cell)
+    clusters = ss.cluster_minima(finite, positions_out, cfg, cell)
     best = clusters[0]
-    alternatives = find_degenerate_alternatives(clusters, cell)
+    alternatives = ss.find_degenerate_alternatives(clusters, cfg, cell)
 
     # Validation only (needs the truth): distance of the reported answer, and how many
     # starts landed in the true basin — the per-start hit rate that sets the spacing budget.
-    dist_to_true = mic_distance(best["centre"], pos_true_arr, cell)
-    hits = int(sum(mic_distance(p, pos_true_arr, cell) < DIST_THRESHOLD
+    dist_to_true = ss.mic_distance(best["centre"], pos_true_arr, cell)
+    hits = int(sum(ss.mic_distance(p, pos_true_arr, cell) < DIST_THRESHOLD
                    for p in positions_out))
 
     print(f"    {METHOD_LABEL}: {n_starts} starts ({n_raw} grid, {100*void_frac:.0f}% "
@@ -1352,15 +669,17 @@ def grid_search(module, params, to_graph, atoms_base, atom_k, specs, pos_true, c
           f"({hits}/{n_starts} starts in the true basin)", flush=True)
     if alternatives:
         alt_txt = ", ".join(f"{d:.2f} Å (loss {l:.3f})" for d, l in alternatives[:3])
-        print(f"    ⚠ DEGENERATE: {len(alternatives)} rival cluster(s) within "
+        print(f"    → {len(alternatives)} further site(s) fit within "
               f"{100 * DEGENERACY_TOL:.0f}% of the best loss — {alt_txt}")
-        print(f"      the spectrum does not determine this site; report it unresolved.")
+        print(f"      several candidate sites are spectrum-consistent (expected for a "
+              f"periodic solid); report the map, not a single answer.")
 
     return dict(pos=best["centre"], loss=best["loss"], clusters=clusters,
                 alternatives=alternatives, dist_to_true=dist_to_true, hits=hits,
                 n_starts=n_starts, n_raw=n_raw, n_valid=n_valid,
                 n_evals=n_starts * ADAM_STEPS,
-                positions=positions_out, losses=finite, rebuild=rebuild)
+                positions=positions_out, losses=finite,
+                all_losses=all_losses, all_pos=all_pos, rebuild=rebuild)
 
 
 # Sanity check — self-consistency of the target and that the site is not flat.
@@ -1374,7 +693,7 @@ _prng = np.random.default_rng(SEED + 7)
 _others_p = np.delete(np.asarray(atoms_orig.positions, dtype=np.float64), atom_k, axis=0)
 for _ in range(1000):
     _probe = _prng.random(3) @ CELL
-    if min_image_min_distance(_probe, _others_p, CELL) >= MIN_DIST_GUARD + GUARD_MARGIN:
+    if ss.min_image_min_distance(_probe, _others_p, CELL) >= MIN_DIST_GUARD + GUARD_MARGIN:
         break
 _atoms_probe = atoms_orig.copy()
 _atoms_probe.positions[atom_k] = _probe
@@ -1435,68 +754,58 @@ print(f"    topology check: search loss {loss_final:.6f}  vs  rebuilt-list "
 
 print(f"\n[STEP 5] Plotting …")
 
-_ATOM_COLOR = {1: "#E8E8E8", 6: "#909090", 7: "#3050F8", 8: "#FF2010",
-               11: "#AB5CF2", 14: "#F0C8A0", 20: "#3DFF00"}
-_ATOM_SIZE  = {1: 15, 6: 60, 7: 60, 8: 55, 11: 90, 14: 80, 20: 90}
-MODEL_COLOR = "royalblue"
-
-# Layout: converged-position map | one overlaid-spectra panel per fitted nucleus.
-n_spec = len(specs)
-fig = plt.figure(figsize=(5 * (1 + n_spec), 4.5), facecolor="white")
-gs  = fig.add_gridspec(1, 1 + n_spec, wspace=0.30)
-
-# Panel 0: where every start converged, projected on the two longest cell axes, coloured
-# by loss; the true site and the reported cluster centres marked. This is the grid-search
-# analogue of the old trajectory panel — it shows the WHOLE landscape the search saw.
-axm = fig.add_subplot(gs[0, 0])
-P   = np.asarray(best["positions"])
-Lg  = np.asarray(best["losses"])
-fin = np.isfinite(Lg)
-sc  = axm.scatter(P[fin, 0], P[fin, 1], c=Lg[fin], s=25, cmap="viridis_r",
-                  norm=__import__("matplotlib").colors.LogNorm(), edgecolors="none", alpha=0.8)
-axm.scatter([pos_true[0]], [pos_true[1]], s=220, marker="*", c="limegreen",
-            edgecolors="k", linewidths=0.5, zorder=5, label="true")
-for c in best["clusters"][:5]:
-    axm.scatter([c["centre"][0]], [c["centre"][1]], s=90, marker="o", facecolors="none",
-                edgecolors="red", linewidths=1.3, zorder=6)
-axm.set_xlabel("x (Å)", fontsize=8); axm.set_ylabel("y (Å)", fontsize=8)
-axm.set_title(f"converged positions (n={int(fin.sum())})\ncircled = distinct minima",
-              fontsize=9)
-axm.legend(fontsize=7, loc="upper right")
-axm.tick_params(labelsize=7)
-fig.colorbar(sc, ax=axm, label=f"loss ({METRIC})", fraction=0.046, pad=0.04)
-
-# Remaining panels: target vs best-cluster spectra, per fitted nucleus.
+# One forward pass at the best cluster gives the recovered spectra for the figure, the CSV
+# and the offline bundle. Everything the figures need is bundled to disk (plot_data.npz +
+# plot_meta.json) so `replot_grid.py` can regenerate them later with no model and no GPU —
+# tweak the aesthetics in e3response.sr_viz and re-run replot rather than the optimiser.
 atoms_rec = atoms_orig.copy()
 atoms_rec.positions[atom_k] = pos_recovered
 pred_rec  = jnp.asarray(predictor(atoms_rec))
 
-spectra_rows = []
-for col, spec in enumerate(specs):
-    ax = fig.add_subplot(gs[0, 1 + col])
+spectra_rows = []          # (symbol, grid, target, best_cluster) — used by the spectra CSV
+_syms, _grids, _tgts, _best, _best_loss = [], [], [], [], []
+for spec in specs:
     grid_np = np.asarray(spec.grid)
     y_tgt   = np.asarray(spec.target)
     y_rec   = np.asarray(species_spectrum(pred_rec, spec))
-    ax.plot(grid_np, y_tgt, color="limegreen", linewidth=1.8, label="target")
-    ax.plot(grid_np, y_rec, color=MODEL_COLOR, linewidth=1.4, label="best cluster")
-    ax.invert_xaxis()               # NMR convention: δ decreases to the right
-    ax.set_xlabel("δ (ppm)", fontsize=8)
-    ax.set_ylabel("intensity", fontsize=8)
     l_rec_s = float(nmr_spectra.spectrum_loss(jnp.asarray(y_rec), spec.target,
                                               x=spec.grid, normalise_mode=NORMALISE,
                                               metric=METRIC))
-    ax.set_title(f"{spec.symbol} spectrum   loss {l_rec_s:.3f}", fontsize=9)
-    ax.legend(fontsize=7)
-    ax.tick_params(labelsize=7)
     spectra_rows.append((spec.symbol, grid_np, y_tgt, y_rec))
+    _syms.append(spec.symbol); _grids.append(grid_np); _tgts.append(y_tgt)
+    _best.append(y_rec); _best_loss.append(l_rec_s)
 
-fig.suptitle(
-    f"NMR grid-search structure resolution  –  structure {MOL_IDX}  atom k={atom_k} "
-    f"({atoms_orig.get_chemical_symbols()[atom_k]})  target={target_label}",
-    fontsize=10,
+clusters = best["clusters"]
+bundle = dict(
+    framework_pos=np.asarray(positions, dtype=float),
+    framework_numbers=np.asarray(atoms_orig.get_atomic_numbers()[:n_atoms], dtype=int),
+    cell=np.asarray(CELL, dtype=float) if CELL is not None else np.zeros((3, 3)),
+    pos_true=np.asarray(pos_true, dtype=float),
+    cand_pos=np.asarray(best["positions"], dtype=float),
+    cand_loss=np.asarray(best["losses"], dtype=float),
+    cluster_centres=(np.asarray([c["centre"] for c in clusters], dtype=float)
+                     if clusters else np.zeros((0, 3))),
+    cluster_losses=np.asarray([c["loss"] for c in clusters], dtype=float),
+    cluster_sizes=np.asarray([c["size"] for c in clusters], dtype=int),
+    all_pos=np.asarray(best["all_pos"], dtype=float),
+    all_losses=np.asarray(best["all_losses"], dtype=float),
+    spec_symbols=np.asarray(_syms),
+    spec_grid=np.asarray(_grids, dtype=float),
+    spec_target=np.asarray(_tgts, dtype=float),
+    spec_best=np.asarray(_best, dtype=float),
+    spec_best_loss=np.asarray(_best_loss, dtype=float),
+    # ── metadata (→ plot_meta.json) ──
+    atom_k=int(atom_k), metric=METRIC, normalise=NORMALISE, mol_idx=int(MOL_IDX),
+    atom_symbol=atoms_orig.get_chemical_symbols()[atom_k], target_label=target_label,
+    dist_threshold=float(DIST_THRESHOLD), degeneracy_tol=float(DEGENERACY_TOL),
+    loss_final=float(loss_final), loss_at_true=float(loss_at_true), rmsd=float(rmsd),
+    resolved=bool(resolved), n_valid=int(best["n_valid"]), n_starts=int(best["n_starts"]),
+    hits=int(best["hits"]), gif_top_n=int(GIF_TOP_N), gif_max_frames=int(GIF_MAX_FRAMES),
+    gif_fps=int(GIF_FPS), start_spacing=float(START_SPACING),
 )
-plt.savefig(PLOT_PATH, dpi=150, bbox_inches="tight")
-plt.close(fig)
+sr_viz.save_bundle(RESULTS_DIR, bundle)
+print(f"  Plot bundle saved to {os.path.join(RESULTS_DIR, sr_viz.DATA_NAME)}")
+sr_viz.grid_result_figure(bundle, PLOT_PATH)
 print(f"  Plot saved to {PLOT_PATH}")
 
 # ── CSV ───────────────────────────────────────────────────────────────────────
@@ -1509,7 +818,7 @@ if SAVE_CSV:
             p = best["positions"][i]
             w.writerow([i, f"{best['losses'][i]:.8f}",
                         f"{p[0]:.6f}", f"{p[1]:.6f}", f"{p[2]:.6f}",
-                        f"{mic_distance(p, pos_true, CELL):.6f}"])
+                        f"{ss.mic_distance(p, pos_true, CELL):.6f}"])
     print(f"  Per-start CSV saved to {CSV_TRAJ_PATH}")
 
     # One row per distinct minimum (cluster).
@@ -1521,7 +830,7 @@ if SAVE_CSV:
             w.writerow([r, f"{c['loss']:.8f}", c["size"],
                         f"{c['centre'][0]:.6f}", f"{c['centre'][1]:.6f}",
                         f"{c['centre'][2]:.6f}",
-                        f"{mic_distance(c['centre'], pos_true, CELL):.6f}", r == 0])
+                        f"{ss.mic_distance(c['centre'], pos_true, CELL):.6f}", r == 0])
     print(f"  Cluster CSV saved to {CSV_SUMMARY_PATH}")
 
 if SAVE_SPECTRA_CSV:
@@ -1532,6 +841,16 @@ if SAVE_SPECTRA_CSV:
             for i in range(len(gx)):
                 w.writerow([symbol, f"{gx[i]:.4f}", f"{y_t[i]:.8e}", f"{y_r[i]:.8e}"])
     print(f"  Spectra CSV saved to {CSV_SPECTRA_PATH}")
+
+# ── GIF: the descent paths of the best starts ──────────────────────────────────
+# The GIF_TOP_N lowest-final-loss trajectories moving through the 3-D cell with fading
+# trails coloured by final loss, alongside their loss curves. Drawn by e3response.sr_viz
+# from the same bundle, so `replot_grid.py` can regenerate/retune it offline.
+if SAVE_GIF:
+    print(f"  Saving GIF → {GIF_PATH} …")
+    sr_viz.grid_descent_gif(bundle, GIF_PATH, top_n=GIF_TOP_N,
+                            max_frames=GIF_MAX_FRAMES, fps=GIF_FPS)
+    print(f"    GIF saved.")
 
 # ── STEP 6: Statistics (grid search over many structures) ─────────────────────
 
