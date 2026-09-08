@@ -407,8 +407,9 @@ def get_structure_and_data_from_log(log_path: pathlib.Path) -> ase.Atoms | None:
         species = molecule_data["species"]
         mu_values = np.array([mu_dict[s] for s in species])
         atoms.arrays["mu"] = mu_values
-        atoms.arrays[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
-        atoms.arrays[atomic.TOTAL_ENERGY] = np.array(molecule_data["energy"])
+        # Graph globals are read from `atoms.info`; `atoms.arrays` holds per-atom data only.
+        atoms.info[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
+        atoms.info[atomic.TOTAL_ENERGY] = np.array(molecule_data["energy"])
 
         # print(atoms.arrays["mu"])
 

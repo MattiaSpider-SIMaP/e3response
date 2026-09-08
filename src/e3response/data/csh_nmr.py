@@ -196,8 +196,9 @@ class CshNmrDataModule(reax.DataModule):
         atoms.arrays["nmr_tensors"] = np.asarray(entry["nmr_tensors"])
         atoms.info["struct_type"] = entry.get("struct_type")
         atoms.info["ca_si_ratio"] = entry.get("ca_si_ratio")
-        atoms.arrays[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
-        atoms.arrays[gcnn.atomic.TOTAL_ENERGY] = np.asarray(entry.get("energy_Ry"))
+        # Graph globals are read from `atoms.info`; `atoms.arrays` holds per-atom data only.
+        atoms.info[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)
+        atoms.info[gcnn.atomic.TOTAL_ENERGY] = np.asarray(entry.get("energy_Ry"))
         return atoms
 
     @override
