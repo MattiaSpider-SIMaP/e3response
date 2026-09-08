@@ -2,7 +2,10 @@
 
 # Optuna search over the NequIP backbone knobs.
 #
-#   e3response train -m experiment=sweep debug=toy data=qm9_nmr model=nequip_nmr
+#   e3response train -i configs/train.yaml -m experiment=sweep debug=toy \
+#       data=qm9_nmr model=nequip_nmr
+#
+# `-i` is needed because the CLI defaults to examples/train.yaml, not this configs/ tree.
 #
 # The four knobs live on the backbone builder, which is entry 0 of the model's `layers` list,
 # hence the `model.model.layers.0.` prefix (the model group file itself nests a `model:` key).
