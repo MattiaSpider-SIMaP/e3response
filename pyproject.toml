@@ -26,6 +26,7 @@ dependencies = [
     "ase",
     "hydra-core",
     "hydra_colorlog",
+    "hydra-optuna-sweeper",
     'jax',
     'jaxlib',
     'jraph',

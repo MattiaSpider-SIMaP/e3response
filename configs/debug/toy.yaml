@@ -1,0 +1,32 @@
+# @package _global_
+
+# Tiny, CPU-only run for fast local iteration.  A full 4-trial sweep should finish in a couple
+# of minutes.
+#
+# JAX picks its backend the first time it is touched, which is during import, i.e. before Hydra
+# gets a look in.  `hydra.job.env_set` below covers the usual case, but if you see the GPU being
+# used anyway, export it in the shell instead:  JAX_PLATFORMS=cpu e3response train ...
+
+defaults:
+  - override /trainer: cpu
+
+hydra:
+  job:
+    env_set:
+      JAX_PLATFORMS: cpu
+
+train:
+  min_epochs: 0 # the default of 10 would keep every trial alive for 10 epochs
+  max_epochs: 2
+  check_val_every_n_epoch: 1
+
+# Skip the test loop: the sweeper only needs the validation metric
+test: false
+
+data:
+  limit: 8 # a handful of graphs is plenty to prove the plumbing works
+  batch_size: 2
+
+listeners:
+  early_stopping:
+    patience: 100 # don't let early stopping cut a 2-epoch run short

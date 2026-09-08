@@ -6,7 +6,7 @@ metrics:
       metric: rmse
       predictions: nodes.predicted_nmr_tensors
       targets: nodes.nmr_tensors
-    # mask: nodes.nmr_active
+      mask: nodes.nmr_active
 
 # optimizer:
 #   _target_: optax.adam
@@ -51,46 +51,20 @@ loss_fn:
 model:
   _target_: tensorial.nn.Sequential
   layers:
-    - _target_: tensorial.gcnn.atomic.SpeciesTransform
-      atomic_numbers: ${from_data.atomic_numbers}
-
-    - _target_: tensorial.gcnn.NodewiseEncoding
-      attrs:
-        species:
-          _target_: tensorial.tensors.OneHot
-          num_classes: ${from_data.n_elements}
-
-    - _target_: tensorial.gcnn.EdgeVectors
-
-    - _target_: tensorial.gcnn.EdgewiseEncoding
-      attrs:
-        edge_vectors:
-          _target_: tensorial.tensors.SphericalHarmonic
-          irreps: 0e + 1o + 2e
-          normalise: True
-
-    - _target_: tensorial.gcnn.RadialBasisEdgeEncoding
+    # ---- backbone: task-agnostic hidden features ----
+    # These four knobs are the Optuna search space.  Keep lmax >= 2: the NMR head below emits
+    # 1x2e, which is unlearnable without l=2 features.
+    - _target_: tensorial.gcnn.build_nequip_backbone
+      num_layers: 3
+      mul: 8
+      lmax: 2
       r_max: ${r_max}
-
-    - _target_: tensorial.gcnn.NodewiseLinear
-      field: attributes
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
-    
-    - _target_: tensorial.gcnn.NequipLayer
-      num_species: ${from_data.n_elements}
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
+      n_elements: ${from_data.n_elements}
       avg_num_neighbours: ${from_data.avg_num_neighbours}
+      atomic_numbers: ${from_data.atomic_numbers}
+      sh_irreps: 0e + 1o + 2e
 
-    - _target_: tensorial.gcnn.NequipLayer
-      num_species: ${from_data.n_elements}
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
-      avg_num_neighbours: ${from_data.avg_num_neighbours}
-
-    - _target_: tensorial.gcnn.NequipLayer
-      num_species: ${from_data.n_elements}
-      irreps_out: 8x0o + 8x0e + 8x1o + 8x1e + 8x2o + 8x2e #+ 8x3o + 8x3e
-      avg_num_neighbours: ${from_data.avg_num_neighbours}
-
+    # ---- readout: NMR specific, stays declarative here ----
     # Reduce the number passing this point
     - _target_: tensorial.gcnn.NodewiseLinear
       irreps_out: 4x0e + 4x0o + 4x1e + 4x1o + 4x2e + 4x2o #+ 2x3o + 2x3e
