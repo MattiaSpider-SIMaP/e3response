@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from ase import Atoms
 import numpy as np
 import pytest
 import reax
@@ -83,36 +84,36 @@ def test_csh_nmr_datamodule_full_dataset_stratified(mock_csh_json, test_engine):
 
 
 def test_csh_nmr_datamodule_only_bulk(mock_csh_json, test_engine):
-    """limit='only bulk' loads only the bulk structures."""
+    """limit='bulk' loads only the bulk structures."""
     dm = CshNmrDataModule(
         r_max=3.0,
         data_file=mock_csh_json,
         train_val_test_split=(0.6, 0.2, 0.2),
         batch_size=1,
-        limit="only bulk",
+        limit="bulk",
     )
     dm.setup(_DummyStage(test_engine))
 
     total = len(dm.data_train) + len(dm.data_val) + len(dm.data_test)
     assert total == _MOCK_N_BULK, (
-        f"Expected {_MOCK_N_BULK} structures with 'only bulk', got {total}"
+        f"Expected {_MOCK_N_BULK} structures with 'bulk', got {total}"
     )
 
 
 def test_csh_nmr_datamodule_only_surface(mock_csh_json, test_engine):
-    """limit='only surface' loads only the surf structures."""
+    """limit='surface' loads only the surf structures."""
     dm = CshNmrDataModule(
         r_max=3.0,
         data_file=mock_csh_json,
         train_val_test_split=(0.6, 0.2, 0.2),
         batch_size=1,
-        limit="only surface",
+        limit="surface",
     )
     dm.setup(_DummyStage(test_engine))
 
     total = len(dm.data_train) + len(dm.data_val) + len(dm.data_test)
     assert total == _MOCK_N_SURF, (
-        f"Expected {_MOCK_N_SURF} structures with 'only surface', got {total}"
+        f"Expected {_MOCK_N_SURF} structures with 'surface', got {total}"
     )
 
 
@@ -122,7 +123,7 @@ def test_csh_nmr_datamodule_only_surface(mock_csh_json, test_engine):
 )
 def test_csh_nmr_constructor_slice_string_limit(mock_csh_json, limit, expected):
     """A slice-string / int limit is routed through the shared parse_limit inside
-    _apply_limit in the constructor (distinct from the 'only bulk'/'only surface' path)."""
+    _apply_limit in the constructor (distinct from the 'bulk'/'surface' path)."""
     dm = CshNmrDataModule(
         r_max=3.0,
         data_file=mock_csh_json,
@@ -131,6 +132,52 @@ def test_csh_nmr_constructor_slice_string_limit(mock_csh_json, limit, expected):
         limit=limit,
     )
     assert len(dm._load_structures()) == expected
+
+
+def test_csh_nmr_load_split_structures(mock_csh_json, test_engine):
+    """load_split_structures reproduces setup()'s partitions as ase.Atoms, and
+    load_split returns exactly those structures as graphs."""
+    kwargs = dict(
+        r_max=3.0,
+        data_file=mock_csh_json,
+        train_val_test_split=(0.6, 0.2, 0.2),
+        batch_size=1,
+    )
+    dm = CshNmrDataModule(**kwargs)
+    dm.setup(_DummyStage(test_engine))
+
+    # A fresh datamodule replays the same split from the default nnx.Rngs(0) stream.
+    dm_post = CshNmrDataModule(**kwargs)
+    for split, data in (("train", dm.data_train), ("val", dm.data_val), ("test", dm.data_test)):
+        structures = dm_post.load_split_structures(split)
+        assert all(isinstance(s, Atoms) for s in structures)
+        assert len(structures) == len(data), f"'{split}' partition size differs from setup()"
+
+        graphs = dm_post.load_split(split)
+        assert len(graphs) == len(structures)
+        for graph, expected in zip(graphs, data):
+            np.testing.assert_allclose(
+                graph.nodes["positions"], expected.nodes["positions"]
+            )
+
+    with pytest.raises(ValueError):
+        dm_post.load_split_structures("validation")
+
+
+def test_csh_nmr_load_split_structures_limit(mock_csh_json):
+    """The split's own `limit` restricts it with the same semantics as the
+    constructor's, applied AFTER the split."""
+    dm = CshNmrDataModule(
+        r_max=3.0,
+        data_file=mock_csh_json,
+        train_val_test_split=(0.6, 0.2, 0.2),
+        batch_size=1,
+    )
+    train = dm.load_split_structures("train")
+    assert len(dm.load_split_structures("train", limit=2)) == 2
+    assert [a.info["struct_type"] for a in dm.load_split_structures("train", limit="bulk")] == [
+        "bulk"
+    ] * sum(a.info["struct_type"] == "bulk" for a in train)
 
 
 def test_csh_nmr_dataloaders(mock_csh_json, test_engine):

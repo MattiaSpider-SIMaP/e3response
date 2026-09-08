@@ -27,15 +27,15 @@ def _apply_limit(structures: list[Atoms], limit: int | str | None) -> list[Atoms
     own `limit` (applied to a single split) so both behave identically:
 
     - None                        → all structures
-    - "only bulk"/"only surface"  → keep only that ``struct_type``
+    - "bulk"/"surface"            → keep only that ``struct_type``
     - int N                       → first N structures
     - "a:b"/"a:b:s"               → Python-slice semantics
     """
     if isinstance(limit, str):
         limit_lower = limit.lower()
-        if limit_lower == "only bulk":
+        if limit_lower == "bulk":
             return [s for s in structures if s.info.get("struct_type") == "bulk"]
-        if limit_lower == "only surface":
+        if limit_lower == "surface":
             return [s for s in structures if s.info.get("struct_type") == "surf"]
     return structures[parse_limit(limit)]
 
@@ -97,10 +97,8 @@ class CshNmrDataModule(reax.DataModule):
     ) -> tuple[list[Atoms], list[Atoms], list[Atoms]]:
         """Stratified train/val/test split: groups structures by their struct_type
         ("bulk"/"surf") and splits each group independently so every partition
-        contains the same ratio of each type.
+        contains the same ratio of each type."""
 
-        (This is the csh-specific stratification key — si_nmr instead groups by the
-        atoms' Qn signature; the method shape is deliberately kept parallel.)"""
         groups: dict[str, list[Atoms]] = collections.defaultdict(list)
         for atoms in structures:
             groups[atoms.info.get("struct_type")].append(atoms)
@@ -119,7 +117,7 @@ class CshNmrDataModule(reax.DataModule):
         return gcnn.atomic.graph_from_ase(
             atoms,
             r_max=self._rmax,
-            atom_include_keys=("numbers", "nmr_tensors", "mask"),
+            atom_include_keys=("numbers", "nmr_tensors"),
             global_include_keys=[keys.EXTERNAL_MAGNETIC_FIELD, gcnn.atomic.TOTAL_ENERGY],
         )
 
@@ -137,7 +135,7 @@ class CshNmrDataModule(reax.DataModule):
 
         :param split: which partition to load: "train", "val" or "test".
         :param limit: further restricts the returned split, with the SAME semantics as
-            the constructor ``limit`` (see `_apply_limit`): "only bulk"/"only surface"
+            the constructor ``limit`` (see `_apply_limit`): "bulk"/"surface"
             filter by ``struct_type``, int N takes the first N, "start:stop"/"start:stop:step"
             apply Python-slice semantics. `None` (default) returns the whole split. It is
             applied on top of the constructor ``limit``, which already restricted the full
@@ -145,6 +143,22 @@ class CshNmrDataModule(reax.DataModule):
         :param rngs: must match whatever was used at training time to reproduce the
             SAME split; defaults to `nnx.Rngs(0)`, REAX's own default when no
             `Trainer`/`Engine` override is given.
+        """
+        return list(map(self._to_graph, self.load_split_structures(split, limit, rngs)))
+
+    def load_split_structures(
+        self,
+        split: str,
+        limit: Optional[Union[int, str]] = None,
+        rngs: "nnx.Rngs | None" = None,
+    ) -> list[Atoms]:
+        """Same as `load_split`, but returns the split's `ase.Atoms` rather than graphs.
+
+        For analysis code that has to work on the geometry itself (e.g. move an atom and
+        rebuild the neighbour list), for which a `jraph.GraphsTuple` — whose topology is
+        frozen at construction — is not enough.
+
+        See `load_split` for the parameters.
         """
         if split not in ("train", "val", "test"):
             raise ValueError(f"split must be 'train', 'val' or 'test', got {split!r}")
@@ -154,9 +168,8 @@ class CshNmrDataModule(reax.DataModule):
         structures = self._load_structures()
         train, val, test = self._grouped_split(structures, rngs)
         split_structures = dict(zip(("train", "val", "test"), (train, val, test)))[split]
-        split_structures = _apply_limit(split_structures, limit)
 
-        return list(map(self._to_graph, split_structures))
+        return _apply_limit(split_structures, limit)
 
     def _load_structures(self) -> list[Atoms]:
         path = pathlib.Path(self._data_file)
@@ -181,7 +194,6 @@ class CshNmrDataModule(reax.DataModule):
             pbc=entry["pbc"],
         )
         atoms.arrays["nmr_tensors"] = np.asarray(entry["nmr_tensors"])
-        atoms.arrays["mask"] = np.asarray(entry["mask"], dtype=bool)
         atoms.info["struct_type"] = entry.get("struct_type")
         atoms.info["ca_si_ratio"] = entry.get("ca_si_ratio")
         atoms.arrays[keys.EXTERNAL_MAGNETIC_FIELD] = np.zeros(3)

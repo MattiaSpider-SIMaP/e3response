@@ -32,7 +32,7 @@ task_name: "train"
 # overwrite from command line with `e3response train tags="[first_tag, second_tag]"`
 tags: [ "dev" ]
 
-r_max: 5.0
+r_max: 3.0
 
 # Gather data use by the model before training
 from_data:
@@ -46,8 +46,9 @@ from_data:
 
 # set False to skip model training
 train:
-  min_epochs: 0 # prevents early stopping
-  max_epochs: 10
+  min_epochs: 10 # prevents early stopping
+  max_epochs: 2000
+  # max_time: 00:00:00:50 # maximum time for training, in HH:MM:SS format
   # perform a validation loop every N training epochs
   check_val_every_n_epoch: 1
 
