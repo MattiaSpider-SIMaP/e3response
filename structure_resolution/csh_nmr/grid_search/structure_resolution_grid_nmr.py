@@ -162,7 +162,7 @@ GRID_POINTS = 1024
 # way — FWHM annealing, the guard threshold, the displacement cap, the live neighbour
 # list — none of them changed the outcome on its own.
 METHOD_LABEL = "adam+multistart"
-ADAM_STEPS   = 500     # iterations per start
+ADAM_STEPS   = 200     # iterations per start
 ADAM_LR0     = 0.08    # Å-scale step at the beginning (cosine-decayed to ADAM_LR1)
 ADAM_LR1     = 0.004   # final step: sets the resolution the answer is polished to
 PRINT_EVALS  = True   # per-start progress. With a vmapped multistart this is a firehose;
@@ -183,7 +183,7 @@ PRINT_EVALS  = True   # per-start progress. With a vmapped multistart this is a 
 # constant size in Å³ (a property of the model, not of the cell). N_STARTS is DERIVED per
 # structure from spacing and cell volume, and reported. Tune the spacing from the per-start
 # hit rate STEP 6 measures, exactly as N_STARTS was tuned on QM9.
-START_SPACING = 2   # Å — target spacing of the grid before clash rejection
+START_SPACING = 2.5   # Å — target spacing of the grid before clash rejection
 MAX_STARTS    = 4096  # safety cap on the raw grid; a huge cell + tiny spacing is refused
 # How many starts are in flight at once. `vmap` replicates the model's activations per lane
 # and reverse-mode AD holds them for the backward pass, so memory grows with lanes × atoms;
@@ -434,6 +434,73 @@ def compute_loss(pred_tensors, specs):
     return float(spectral_loss(jnp.asarray(pred_tensors), specs))
 
 
+# ── Spectrum informativeness ───────────────────────────────────────────────────
+# How much structural information a target spectrum carries, computed from the CURVE
+# alone (so it is deployment-faithful: a real experiment has the spectrum, not the
+# per-atom shifts). A nucleus with several well-separated peaks pins the missing atom
+# through many constraints; a single line pins almost nothing. This is a PRIOR predictor
+# of resolvability — computable before any optimisation — to sit next to the measured
+# resolution rate and show it predicts the outcome.
+
+def spectrum_informativeness(spec):
+    """Info score for one target spectrum: ``I = (D / FWHM) · n``.
+
+    ``n``  = resolved peaks   — local maxima of the target above 5% of its height, i.e.
+             chemical environments the linewidth actually separates.
+    ``D``  = peak dispersion  — intensity-weighted std of those peak positions (ppm); a
+             single site gives ``D = 0`` (one peak, zero spread) → ``I = 0``.
+    ``I``  = (D / FWHM) · n   — dimensionless; grows when many peaks span many linewidths.
+    Returns dict(info, dispersion, n_peaks).
+    """
+    x = np.asarray(spec.grid, dtype=float)
+    y = np.asarray(spec.target, dtype=float)
+    if not np.isfinite(y).any() or y.max() <= 0:
+        return dict(info=0.0, dispersion=0.0, n_peaks=0)
+    yn = y / y.max()
+    interior = (yn[1:-1] > yn[:-2]) & (yn[1:-1] >= yn[2:]) & (yn[1:-1] > 0.05)
+    idx = np.where(interior)[0] + 1
+    if idx.size == 0:                       # degenerate: take the global max as one peak
+        idx = np.array([int(np.argmax(y))])
+    pos, h = x[idx], y[idx]
+    xbar = float(np.sum(h * pos) / np.sum(h))
+    disp = float(np.sqrt(np.sum(h * (pos - xbar) ** 2) / np.sum(h)))
+    n = int(idx.size)
+    return dict(info=(disp / float(spec.fwhm)) * n, dispersion=disp, n_peaks=n)
+
+
+def spectra_info(specs):
+    """Per-nucleus informativeness + the set total (sum over the fitted nuclei)."""
+    per = {s.symbol: spectrum_informativeness(s) for s in specs}
+    total = float(sum(v["info"] for v in per.values()))
+    return per, total
+
+
+def sensitivity_scores(module, params, to_graph, atoms_base, atom_k, specs, delta=0.15):
+    """Model-based companion S: mean |Δσ_iso| (ppm) of each fitted nucleus per `delta` (Å)
+    of displacement of the atom being placed — a central finite difference over ±x,±y,±z.
+
+    This is what the spectrum-only `I` cannot see: how strongly each spectrum RESPONDS to
+    the atom's position (a spectrum can be rich yet insensitive to *this* atom). It needs
+    the model, so it is a VALIDATION-side diagnostic, never usable in deployment. Cheap
+    (6 forward passes). Returns {symbol: mean |Δσ_iso| per delta Å}.
+    """
+    pos0 = np.asarray(atoms_base.positions, dtype=float)
+    syms = np.array(atoms_base.get_chemical_symbols())
+    def iso(pos):
+        a = atoms_base.copy(); a.positions = pos
+        t = np.asarray(predictor(a))
+        return np.trace(t, axis1=1, axis2=2) / 3.0
+    acc = {s.symbol: [] for s in specs}
+    for ax in range(3):
+        for sgn in (+1.0, -1.0):
+            p = pos0.copy(); p[atom_k, ax] += sgn * delta
+            d = np.abs(iso(p) - iso(pos0))
+            for s in specs:
+                m = syms == s.symbol
+                acc[s.symbol].append(float(d[m].mean()) if m.any() else 0.0)
+    return {sym: float(np.mean(v)) for sym, v in acc.items()}
+
+
 # ── STEP 0: Load model ─────────────────────────────────────────────────────────
 
 if not os.path.isdir(RUN_DIR):
@@ -522,6 +589,18 @@ n_sites = int(sum(float(s.weights.sum()) for s in specs))
 print(f"  → fitting {len(specs)} spectrum/spectra over {n_sites} site(s); "
       f"atom k is {'' if any(float(s.weights[atom_k]) > 0 for s in specs) else 'NOT '}"
       f"among them")
+
+# Informativeness: a PRIOR predictor of resolvability, from the target spectra alone
+# (spectrum-only I) plus the model-based sensitivity S (how much each spectrum responds
+# to atom k moving). Printed here so it can be read against the resolution outcome below.
+_info_per, _info_total = spectra_info(specs)
+_sens = sensitivity_scores(module, params, to_graph, atoms_orig, atom_k, specs)
+print(f"  informativeness (spectrum-only  I = (D/FWHM)·n):")
+for s in specs:
+    ip = _info_per[s.symbol]
+    print(f"    {s.symbol:>2}: I={ip['info']:6.2f}  (dispersion {ip['dispersion']:6.2f} ppm, "
+          f"{ip['n_peaks']} resolved peak(s))   sensitivity S={_sens[s.symbol]:5.2f} ppm/0.15Å")
+print(f"    total I = {_info_total:.2f}  (higher ⇒ the spectrum set should pin atom k better)")
 
 # ── STEP 2: The search cell (no perturbation, no positional prior) ─────────────
 # Grid search does not move the atom away from a known truth — it forgets the truth
@@ -868,9 +947,9 @@ else:
     # (loss at or below it — the model's minimum is misplaced). n_alt (rival clusters) is the
     # same warning from observables alone, the one that carries over to a real refinement.
     stats = dict(dist=[], loss=[], n_starts=[], hit_rate=[], resolved=0, reliable=0,
-                 total=0, model_limited=0, search_failed=0)
+                 total=0, model_limited=0, search_failed=0, info=[])
     stat_meta = dict(mol=[], atom=[], species=[], loss_true=[], hits=[], n_alt=[],
-                     n_clusters=[])
+                     n_clusters=[], info_total=[], sens_total=[])
 
     stat_start = MOL_IDX + 1
     stat_end   = min(stat_start + N_MOL_STAT, len(structures))
@@ -897,6 +976,12 @@ else:
                 continue   # none of SPECTRUM_SPECIES in this structure
             loss_true_i = compute_loss(predictor(atoms_i), specs_i)
 
+            # PRIOR predictor of resolvability (see spectrum_informativeness): the
+            # spectrum-only info I and the model-based sensitivity S, per structure.
+            _iper_i, _itot_i = spectra_info(specs_i)
+            _sens_i = sensitivity_scores(module, params, to_graph, atoms_i, k_i, specs_i)
+            _sens_tot_i = float(sum(_sens_i.values()))
+
             res = grid_search(module, params, to_graph, atoms_i, k_i, specs_i,
                               pos_i[k_i], cell_i)
             dist_i = res["dist_to_true"]
@@ -910,10 +995,13 @@ else:
             stat_meta["hits"].append(res["hits"])
             stat_meta["n_alt"].append(len(res["alternatives"]))
             stat_meta["n_clusters"].append(len(res["clusters"]))
+            stat_meta["info_total"].append(_itot_i)
+            stat_meta["sens_total"].append(_sens_tot_i)
             stats["dist"].append(dist_i)
             stats["loss"].append(loss_i)
             stats["n_starts"].append(res["n_starts"])
             stats["hit_rate"].append(rate_i)
+            stats["info"].append(_itot_i)
             stats["total"] += 1
 
             ok_dist = dist_i < DIST_THRESHOLD
@@ -936,6 +1024,7 @@ else:
                 flag = "✗ miss (search)"
             print(f"  struct {mol_i:3d}  atom {k_i:3d} ({stat_meta['species'][-1]}) → "
                   f"|Δr|={dist_i:.3f} Å  loss={loss_i:.2f} (true {loss_true_i:.2f})  "
+                  f"I={_itot_i:5.2f} S={_sens_tot_i:4.2f}  "
                   f"{res['hits']}/{res['n_starts']} on target, "
                   f"{len(res['clusters'])} minima, {len(res['alternatives'])} rivals  {flag}")
 
@@ -964,19 +1053,28 @@ else:
         _flagged = int(np.sum(np.asarray(stat_meta["n_alt"]) > 0))
         print(f"  degeneracy warnings = {_flagged}/{stats['total']} case(s) had a rival "
               f"cluster within {100 * DEGENERACY_TOL:.0f}% of the best loss")
+        # Informativeness of THIS species set (spectrum-only I + model-based sensitivity S),
+        # the headline for the Na-only vs Na+Si contrast: higher I/S should track a higher
+        # resolved rate. Compare these two lines across the two runs.
+        _I = np.asarray(stats["info"]); _S = np.asarray(stat_meta["sens_total"])
+        print(f"  informativeness for {tuple(SPECTRUM_SPECIES)}: mean I = {_I.mean():.2f}  "
+              f"(median {np.median(_I):.2f})   mean sensitivity S = {_S.mean():.2f} ppm/0.15Å")
 
     # ── Per-case statistics CSV ────────────────────────────────────────────────
     if SAVE_CSV and stat_meta["mol"]:
         with open(STAT_CSV_PATH, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["case", "struct_idx", "atom_k", "species", "dist_ang", "loss",
-                        "loss_at_true", "n_starts", "starts_on_target", "n_clusters",
-                        "n_rival_clusters", "resolved", "reliable", "model_limited"])
+                        "loss_at_true", "info_total", "sensitivity_total", "n_starts",
+                        "starts_on_target", "n_clusters", "n_rival_clusters",
+                        "resolved", "reliable", "model_limited"])
             for i in range(len(stat_meta["mol"])):
                 d = stats["dist"][i]; l = stats["loss"][i]; lt = stat_meta["loss_true"][i]
                 ok = d < DIST_THRESHOLD
                 w.writerow([i, stat_meta["mol"][i], stat_meta["atom"][i],
                             stat_meta["species"][i], f"{d:.6f}", f"{l:.8f}", f"{lt:.8f}",
+                            f"{stat_meta['info_total'][i]:.6f}",
+                            f"{stat_meta['sens_total'][i]:.6f}",
                             stats["n_starts"][i], stat_meta["hits"][i],
                             stat_meta["n_clusters"][i], stat_meta["n_alt"][i],
                             bool(ok), bool(ok and l < RELIABLE_LOSS_TOL),

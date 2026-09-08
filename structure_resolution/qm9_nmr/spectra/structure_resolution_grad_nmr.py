@@ -175,7 +175,7 @@ GRID_POINTS = 1024
 # way — FWHM annealing, the guard threshold, the displacement cap, the live neighbour
 # list — none of them changed the outcome on its own.
 METHOD_LABEL = "adam+multistart"
-ADAM_STEPS   = 500     # iterations per start
+ADAM_STEPS   = 200     # iterations per start
 ADAM_LR0     = 0.08    # Å-scale step at the beginning (cosine-decayed to ADAM_LR1)
 ADAM_LR1     = 0.004   # final step: sets the resolution the answer is polished to
 PRINT_EVALS  = False   # per-start progress. With a vmapped multistart this is a firehose;
